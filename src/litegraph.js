@@ -2267,7 +2267,7 @@
         }
         var node = this.getNodeById(link.target_id);
         if (node) {
-            node.disconnectInput(link.target_slot);
+            node.disconnectInput(link.target_slot, link_id);
         }
     };
 
@@ -4792,7 +4792,10 @@
      * @param {number_or_string} slot (could be the number of the slot or the string with the name of the slot)
      * @return {boolean} if it was disconnected successfully
      */
-    LGraphNode.prototype.disconnectInput = function(slot) {
+    LGraphNode.prototype.disconnectInput = function(slot, link_id) {
+        if (link_id && typeof link_id === "object") {
+            link_id = null;
+        }
         //seek for the output slot
         if (slot.constructor === String) {
             slot = this.findInputSlot(slot);
@@ -4817,37 +4820,48 @@
         var links = getInputLinks(input);
 		if(links && links.length)
 		{
-			this.inputs[slot].link = null;
-			if (this.inputs[slot].links) {
-				this.inputs[slot].links = null;
+			var links_to_remove = null;
+			if (link_id != null) {
+				if (links.indexOf(link_id) === -1) {
+					return false;
+				}
+				links_to_remove = [link_id];
+			} else {
+				links_to_remove = links.slice();
 			}
 
-			for (var lnk = 0; lnk < links.length; ++lnk) {
-				var link_id = links[lnk];
+			for (var lnk = 0; lnk < links_to_remove.length; ++lnk) {
+				var current_link_id = links_to_remove[lnk];
 				//remove other side
-				var link_info = this.graph.links[link_id];
+				var link_info = this.graph.links[current_link_id];
 				if (!link_info) {
+					removeInputLink(input, current_link_id);
 					continue;
 				}
 				var target_node = this.graph.getNodeById(link_info.origin_id);
 				if (!target_node) {
+					removeInputLink(input, current_link_id);
+					delete this.graph.links[current_link_id];
 					continue;
 				}
 
 				var output = target_node.outputs[link_info.origin_slot];
 				if (!output || !output.links || output.links.length == 0) {
+					removeInputLink(input, current_link_id);
+					delete this.graph.links[current_link_id];
 					continue;
 				}
 
-				//search in the inputs list for this link
+				//search in the outputs list for this link
 				for (var i = 0, l = output.links.length; i < l; i++) {
-					if (output.links[i] == link_id) {
+					if (output.links[i] == current_link_id) {
 						output.links.splice(i, 1);
 						break;
 					}
 				}
 
-				delete this.graph.links[link_id]; //remove from the pool
+				removeInputLink(input, current_link_id);
+				delete this.graph.links[current_link_id]; //remove from the pool
 				if (this.graph) {
 					this.graph._version++;
 				}
@@ -4863,7 +4877,7 @@
 				if (target_node.onConnectionsChange) {
 					target_node.onConnectionsChange(
 						LiteGraph.OUTPUT,
-						i,
+						link_info.origin_slot,
 						false,
 						link_info,
 						output
@@ -4873,7 +4887,7 @@
 					this.graph.onNodeConnectionChange(
 						LiteGraph.OUTPUT,
 						target_node,
-						i
+						link_info.origin_slot
 					);
 					this.graph.onNodeConnectionChange(LiteGraph.INPUT, this, slot);
 				}
@@ -6262,12 +6276,17 @@ LGraphNode.prototype.executeAction = function(action)
                                         }
                                     }
 
-                                    if (input.link !== null) {
+                                    var input_link_id = getInputLinkId(input);
+                                    if (input_link_id !== null) {
                                         var link_info = this.graph.links[
-                                            input.link
+                                            input_link_id
                                         ]; //before disconnecting
+                                        if (!link_info) {
+                                            skip_action = true;
+                                            break;
+                                        }
                                         if (LiteGraph.click_do_break_link_to){
-                                            node.disconnectInput(i);
+                                            node.disconnectInput(i, input_link_id);
                                             this.dirty_bgcanvas = true;
                                             skip_action = true;
                                         }else{
@@ -6280,7 +6299,7 @@ LGraphNode.prototype.executeAction = function(action)
                                             e.shiftKey
                                         ) {
                                             if (!LiteGraph.click_do_break_link_to){
-                                                node.disconnectInput(i);
+                                                node.disconnectInput(i, input_link_id);
                                             }
                                             this.connecting_node = this.graph._nodes_by_id[
                                                 link_info.origin_id
