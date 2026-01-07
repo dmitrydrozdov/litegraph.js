@@ -1885,6 +1885,12 @@
             LiteGraph.GraphInput,
             this._input_nodes
         );
+        if (LiteGraph.EventInput) {
+            this._event_input_nodes = this.findNodesByClass(
+                LiteGraph.EventInput,
+                this._event_input_nodes
+            );
+        }
         for (var i = 0; i < this._input_nodes.length; ++i) {
             var node = this._input_nodes[i];
             if (node.properties.name != action) {
@@ -1893,6 +1899,16 @@
             //wrap node.onAction(action, param);
             node.actionDo(action, param, options);
             break;
+        }
+        if (this._event_input_nodes) {
+            for (var i = 0; i < this._event_input_nodes.length; ++i) {
+                var node = this._event_input_nodes[i];
+                if (node.properties.name != action) {
+                    continue;
+                }
+                node.actionDo(action, param, options);
+                break;
+            }
         }
     };
 

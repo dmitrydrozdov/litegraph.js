@@ -641,6 +641,88 @@
     LiteGraph.GraphInput = GraphInput;
     LiteGraph.registerNodeType("graph/input", GraphInput);
 
+    //Event input for a subgraph
+    function EventInput() {
+        this.addOutput("", LiteGraph.EVENT);
+
+        this.name_in_graph = "";
+        this.properties = { name: "" };
+
+        var that = this;
+        this.name_widget = this.addWidget(
+            "text",
+            "Name",
+            this.properties.name,
+            function(v) {
+                if (!v) {
+                    return;
+                }
+                that.setProperty("name", v);
+            }
+        );
+
+        this.widgets_up = true;
+        this.size = [180, 40];
+    }
+
+    EventInput.title = "Event Input";
+    EventInput.desc = "Event input of the graph";
+
+    EventInput.prototype.onConfigure = function() {
+        this.updateType();
+    };
+
+    EventInput.prototype.updateType = function() {
+        if (this.outputs[0].type != LiteGraph.EVENT) {
+            if (!LiteGraph.isValidConnection(this.outputs[0].type, LiteGraph.EVENT)) {
+                this.disconnectOutput(0);
+            }
+            this.outputs[0].type = LiteGraph.EVENT;
+        }
+
+        if (this.graph && this.name_in_graph) {
+            this.graph.changeInputType(this.name_in_graph, LiteGraph.ACTION);
+        }
+    };
+
+    EventInput.prototype.onPropertyChanged = function(name, v) {
+        if (name == "name") {
+            if (v == "" || v == this.name_in_graph || v == "enabled") {
+                return false;
+            }
+            if (this.graph) {
+                if (this.name_in_graph) {
+                    this.graph.renameInput(this.name_in_graph, v);
+                    this.graph.changeInputType(v, LiteGraph.ACTION);
+                } else {
+                    this.graph.addInput(v, LiteGraph.ACTION);
+                }
+            }
+            this.name_widget.value = v;
+            this.name_in_graph = v;
+        }
+    };
+
+    EventInput.prototype.getTitle = function() {
+        if (this.flags.collapsed) {
+            return this.properties.name;
+        }
+        return this.title;
+    };
+
+    EventInput.prototype.onAction = function(action, param) {
+        this.triggerSlot(0, param);
+    };
+
+    EventInput.prototype.onRemoved = function() {
+        if (this.name_in_graph) {
+            this.graph.removeInput(this.name_in_graph);
+        }
+    };
+
+    LiteGraph.EventInput = EventInput;
+    LiteGraph.registerNodeType("graph/eventinput", EventInput);
+
     //Output for a subgraph
     function GraphOutput() {
         this.addInput("", "");
