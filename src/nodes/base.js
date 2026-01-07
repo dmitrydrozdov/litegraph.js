@@ -550,17 +550,17 @@
 		}
 
 		//update widget
-		if(type == "number")
+		if(type == "number" || LiteGraph.IEC61499.DATATYPES.NUMERIC.includes(type))
 		{
 			this.value_widget.type = "number";
 			this.value_widget.value = 0;
 		}
-		else if(type == "boolean")
+		else if(type == "boolean" || LiteGraph.IEC61499.DATATYPES.BOOLEAN.includes(type))
 		{
 			this.value_widget.type = "toggle";
 			this.value_widget.value = true;
 		}
-		else if(type == "string")
+		else if(type == "string" || LiteGraph.IEC61499.DATATYPES.STRING.includes(type))
 		{
 			this.value_widget.type = "text";
 			this.value_widget.value = "";
@@ -647,7 +647,17 @@
 
         this.name_in_graph = "";
         this.properties = { name: "", type: "" };
+        // this.properties = { name: "", type: "", value: null };
         var that = this;
+
+        // this.value_widget = this.addWidget(
+        //     "number",
+        //     "Value",
+        //     this.properties.value,
+        //     function(v) {
+        //         that.setProperty("value",v);
+        //     }
+        // );
 
         // Object.defineProperty(this.properties, "name", {
         //     get: function() {
@@ -1373,12 +1383,6 @@ LiteGraph.registerNodeType("basic/jsonparse", JSONParse);
         [""],
         "number"
     );
-
-    function length(v) {
-        if(v && v.length != null)
-			return Number(v.length);
-		return 0;
-    }
 
     LiteGraph.wrapFunctionAsNode(
         "basic/not",

@@ -14,6 +14,16 @@
     var LiteGraph = (global.LiteGraph = {
         VERSION: 0.4,
 
+        IEC61499: {
+            DATATYPES: {
+                NUMERIC: [ "SINT", "INT", "DINT", "LINT", "USINT", "UINT", "UDINT", "ULINT", "REAL", "LREAL" ],
+                BOOLEAN: [ "BOOL" ],
+                STRING: [ "STRING", "WSTRING" ],
+                TIME: [ "TIME", "LTIME", "DATE", "TOD", "DT" ]
+            }
+
+        },
+
         CANVAS_GRID_SIZE: 10,
 
         NODE_TITLE_HEIGHT: 30,
@@ -57,6 +67,7 @@
         CARD_SHAPE: 4,
         ARROW_SHAPE: 5,
         GRID_SHAPE: 6, // intended for slot arrays
+        FB_SHAPE: 7, // iec61499 function block shape
 
         //enums
         INPUT: 1,
@@ -300,6 +311,9 @@
                 let slotType = allTypes[i];
                 if (slotType === "") {
                     slotType = "*";
+                }
+                if (typeof slotType === "string" && slotType.toLowerCase() === "bool") {
+                    slotType = "boolean";
                 }
                 const registerTo = out
                     ? "registered_slot_out_types"
@@ -698,6 +712,12 @@
             type_b = String(type_b);
             type_a = type_a.toLowerCase();
             type_b = type_b.toLowerCase();
+            if (type_a === "bool") {
+                type_a = "boolean";
+            }
+            if (type_b === "bool") {
+                type_b = "boolean";
+            }
 
             // For nodes supporting multiple connection types
             if (type_a.indexOf(",") == -1 && type_b.indexOf(",") == -1) {
@@ -14421,4 +14441,3 @@ if (typeof exports != "undefined") {
     exports.LGraphCanvas = this.LGraphCanvas;
     exports.ContextMenu = this.ContextMenu;
 }
-

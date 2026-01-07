@@ -1,3 +1,7 @@
+# iec61499 mods
+
+This is a fork of litegraph.js with a few extra mods to support IEC 61499 editor frontend.
+
 # litegraph.js
 
 A library in Javascript to create graphs in the browser similar to Unreal Blueprints. Nodes can be programmed easily and it includes an editor to construct and tests the graphs.
