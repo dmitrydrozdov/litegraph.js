@@ -866,6 +866,87 @@
     LiteGraph.GraphOutput = GraphOutput;
     LiteGraph.registerNodeType("graph/output", GraphOutput);
 
+    //Event output for a subgraph
+    function EventOutput() {
+        this.addInput("", LiteGraph.ACTION);
+
+        this.name_in_graph = "";
+        this.properties = { name: "" };
+
+        var that = this;
+        this.name_widget = this.addWidget(
+            "text",
+            "Name",
+            this.properties.name,
+            function(v) {
+                if (!v) {
+                    return;
+                }
+                that.setProperty("name", v);
+            }
+        );
+        this.widgets_up = true;
+        this.size = [180, 40];
+    }
+
+    EventOutput.title = "Event Output";
+    EventOutput.desc = "Event output of the graph";
+
+    EventOutput.prototype.onConfigure = function() {
+        this.updateType();
+    };
+
+    EventOutput.prototype.updateType = function() {
+        if (this.inputs[0].type != LiteGraph.ACTION) {
+            if (!LiteGraph.isValidConnection(this.inputs[0].type, LiteGraph.ACTION)) {
+                this.disconnectInput(0);
+            }
+            this.inputs[0].type = LiteGraph.ACTION;
+        }
+
+        if (this.graph && this.name_in_graph) {
+            this.graph.changeOutputType(this.name_in_graph, LiteGraph.EVENT);
+        }
+    };
+
+    EventOutput.prototype.onPropertyChanged = function(name, v) {
+        if (name == "name") {
+            if (v == "" || v == this.name_in_graph || v == "enabled") {
+                return false;
+            }
+            if (this.graph) {
+                if (this.name_in_graph) {
+                    this.graph.renameOutput(this.name_in_graph, v);
+                    this.graph.changeOutputType(v, LiteGraph.EVENT);
+                } else {
+                    this.graph.addOutput(v, LiteGraph.EVENT);
+                }
+            }
+            this.name_widget.value = v;
+            this.name_in_graph = v;
+        }
+    };
+
+    EventOutput.prototype.getTitle = function() {
+        if (this.flags.collapsed) {
+            return this.properties.name;
+        }
+        return this.title;
+    };
+
+    EventOutput.prototype.onAction = function(action, param) {
+        this.graph.trigger(this.properties.name, param);
+    };
+
+    EventOutput.prototype.onRemoved = function() {
+        if (this.name_in_graph) {
+            this.graph.removeOutput(this.name_in_graph);
+        }
+    };
+
+    LiteGraph.EventOutput = EventOutput;
+    LiteGraph.registerNodeType("graph/eventoutput", EventOutput);
+
     //Constant
     function ConstantNumber() {
         this.addOutput("value", "number");
