@@ -697,47 +697,69 @@
          * @return {Boolean} true if they can be connected
          */
         isValidConnection: function(type_a, type_b) {
+            var array_size_a = null;
+            var array_size_b = null;
+            if (type_a && typeof type_a === "object") {
+                array_size_a = type_a.arraySize;
+                type_a = type_a.type;
+            }
+            if (type_b && typeof type_b === "object") {
+                array_size_b = type_b.arraySize;
+                type_b = type_b.type;
+            }
+
 			if (type_a=="" || type_a==="*") type_a = 0;
 			if (type_b=="" || type_b==="*") type_b = 0;
-            if (
+            var type_match =
                 !type_a //generic output
                 || !type_b // generic input
                 || type_a == type_b //same type (is valid for triggers)
-                || (type_a == LiteGraph.EVENT && type_b == LiteGraph.ACTION)
-            ) {
-                return true;
-            }
+                || (type_a == LiteGraph.EVENT && type_b == LiteGraph.ACTION);
 
             // Enforce string type to handle toLowerCase call (-1 number not ok)
-            type_a = String(type_a);
-            type_b = String(type_b);
-            type_a = type_a.toLowerCase();
-            type_b = type_b.toLowerCase();
-            if (type_a === "bool") {
-                type_a = "boolean";
-            }
-            if (type_b === "bool") {
-                type_b = "boolean";
-            }
+            if (!type_match) {
+                type_a = String(type_a);
+                type_b = String(type_b);
+                type_a = type_a.toLowerCase();
+                type_b = type_b.toLowerCase();
+                if (type_a === "bool") {
+                    type_a = "boolean";
+                }
+                if (type_b === "bool") {
+                    type_b = "boolean";
+                }
 
-            // For nodes supporting multiple connection types
-            if (type_a.indexOf(",") == -1 && type_b.indexOf(",") == -1) {
-                return type_a == type_b;
-            }
-
-            // Check all permutations to see if one is valid
-            var supported_types_a = type_a.split(",");
-            var supported_types_b = type_b.split(",");
-            for (var i = 0; i < supported_types_a.length; ++i) {
-                for (var j = 0; j < supported_types_b.length; ++j) {
-                    if(this.isValidConnection(supported_types_a[i],supported_types_b[j])){
-					//if (supported_types_a[i] == supported_types_b[j]) {
-                        return true;
+                // For nodes supporting multiple connection types
+                if (type_a.indexOf(",") == -1 && type_b.indexOf(",") == -1) {
+                    type_match = type_a == type_b;
+                } else {
+                    // Check all permutations to see if one is valid
+                    var supported_types_a = type_a.split(",");
+                    var supported_types_b = type_b.split(",");
+                    for (var i = 0; i < supported_types_a.length; ++i) {
+                        for (var j = 0; j < supported_types_b.length; ++j) {
+                            if(this.isValidConnection(supported_types_a[i],supported_types_b[j])){
+                            //if (supported_types_a[i] == supported_types_b[j]) {
+                                type_match = true;
+                                break;
+                            }
+                        }
+                        if (type_match) {
+                            break;
+                        }
                     }
                 }
             }
 
-            return false;
+            if (!type_match) {
+                return false;
+            }
+
+            if (array_size_a != null || array_size_b != null) {
+                return array_size_a === array_size_b;
+            }
+
+            return true;
         },
 
         /**
@@ -3615,13 +3637,21 @@
      * @param {string} name
      * @param {string} type string defining the output type ("vec3","number",...)
      * @param {Object} extra_info this can be used to have special properties of an output (label, special color, position, etc)
+     * @param {number} arraySize optional array size for array-like slots
      */
-    LGraphNode.prototype.addOutput = function(name, type, extra_info) {
+    LGraphNode.prototype.addOutput = function(name, type, extra_info, arraySize) {
+        if (extra_info && typeof extra_info === "number" && arraySize == null) {
+            arraySize = extra_info;
+            extra_info = null;
+        }
         var output = { name: name, type: type, links: null };
         if (extra_info) {
             for (var i in extra_info) {
                 output[i] = extra_info[i];
             }
+        }
+        if (arraySize != null) {
+            output.arraySize = arraySize;
         }
 
         if (!this.outputs) {
@@ -3705,14 +3735,22 @@
      * @param {string} name
      * @param {string} type string defining the input type ("vec3","number",...), it its a generic one use 0
      * @param {Object} extra_info this can be used to have special properties of an input (label, color, position, etc)
+     * @param {number} arraySize optional array size for array-like slots
      */
-    LGraphNode.prototype.addInput = function(name, type, extra_info) {
+    LGraphNode.prototype.addInput = function(name, type, extra_info, arraySize) {
+        if (extra_info && typeof extra_info === "number" && arraySize == null) {
+            arraySize = extra_info;
+            extra_info = null;
+        }
         type = type || 0;
         var input = { name: name, type: type, link: null };
         if (extra_info) {
             for (var i in extra_info) {
                 input[i] = extra_info[i];
             }
+        }
+        if (arraySize != null) {
+            input.arraySize = arraySize;
         }
 
         if (!this.inputs) {
@@ -4529,7 +4567,7 @@
         }
 
 		//check target_slot and check connection types
-        if (target_slot===false || target_slot===null || !LiteGraph.isValidConnection(output.type, input.type))
+        if (target_slot===false || target_slot===null || !LiteGraph.isValidConnection(output, input))
 		{
 	        this.setDirtyCanvas(false, true);
 			if(changed)
@@ -6731,10 +6769,10 @@ LGraphNode.prototype.executeAction = function(action)
                             //check if I have a slot below de mouse
                             var slot = this.isOverNodeInput( node, e.canvasX, e.canvasY, pos );
                             if (slot != -1 && node.inputs[slot]) {
-                                var slot_type = node.inputs[slot].type;
-                                if ( LiteGraph.isValidConnection( this.connecting_output.type, slot_type ) ) {
+                                var slot_info = node.inputs[slot];
+                                if ( LiteGraph.isValidConnection( this.connecting_output, slot_info ) ) {
                                     this._highlight_input = pos;
-									this._highlight_input_slot = node.inputs[slot]; // XXX CHECK THIS
+									this._highlight_input_slot = slot_info; // XXX CHECK THIS
                                 }
                             } else {
                                 this._highlight_input = null;
@@ -6753,8 +6791,8 @@ LGraphNode.prototype.executeAction = function(action)
                             //check if I have a slot below de mouse
                             var slot = this.isOverNodeOutput( node, e.canvasX, e.canvasY, pos );
                             if (slot != -1 && node.outputs[slot]) {
-                                var slot_type = node.outputs[slot].type;
-                                if ( LiteGraph.isValidConnection( this.connecting_input.type, slot_type ) ) {
+                                var slot_info = node.outputs[slot];
+                                if ( LiteGraph.isValidConnection( this.connecting_input, slot_info ) ) {
                                     this._highlight_output = pos;
                                 }
                             } else {
@@ -7825,7 +7863,7 @@ LGraphNode.prototype.executeAction = function(action)
 
 			//autoconnect when possible (very basic, only takes into account first input-output)
 			var input_link_id = node.inputs && node.inputs.length ? getInputLinkId(node.inputs[0]) : null;
-			if(node.inputs && node.inputs.length && node.outputs && node.outputs.length && LiteGraph.isValidConnection( node.inputs[0].type, node.outputs[0].type ) && input_link_id && node.outputs[0].links && node.outputs[0].links.length ) 
+			if(node.inputs && node.inputs.length && node.outputs && node.outputs.length && LiteGraph.isValidConnection( node.inputs[0], node.outputs[0] ) && input_link_id && node.outputs[0].links && node.outputs[0].links.length ) 
 			{
 				var input_link = node.graph.links[ input_link_id ];
 				var output_link = node.graph.links[ node.outputs[0].links[0] ];
@@ -8864,7 +8902,7 @@ LGraphNode.prototype.executeAction = function(action)
                     
                     ctx.globalAlpha = editor_alpha;
                     //change opacity of incompatible slots when dragging a connection
-                    if ( this.connecting_output && !LiteGraph.isValidConnection( slot.type , out_slot.type) ) {
+                    if ( this.connecting_output && !LiteGraph.isValidConnection( slot, out_slot ) ) {
                         ctx.globalAlpha = 0.4 * editor_alpha;
                     }
 
@@ -8887,7 +8925,7 @@ LGraphNode.prototype.executeAction = function(action)
 
                     ctx.beginPath();
 
-					if (slot_type == "array"){
+					if (slot_type == "array" || slot.arraySize != null){
                         slot_shape = LiteGraph.GRID_SHAPE; // place in addInput? addOutput instead?
                     }
                     
@@ -8963,7 +9001,7 @@ LGraphNode.prototype.executeAction = function(action)
                     var slot_shape = slot.shape;
                     
                     //change opacity of incompatible slots when dragging a connection
-                    if (this.connecting_input && !LiteGraph.isValidConnection( slot_type , in_slot.type) ) {
+                    if (this.connecting_input && !LiteGraph.isValidConnection( slot, in_slot ) ) {
                         ctx.globalAlpha = 0.4 * editor_alpha;
                     }
                     
@@ -8986,7 +9024,7 @@ LGraphNode.prototype.executeAction = function(action)
                     ctx.beginPath();
                     //ctx.rect( node.size[0] - 14,i*14,10,10);
 
-					if (slot_type == "array"){
+					if (slot_type == "array" || slot.arraySize != null){
                         slot_shape = LiteGraph.GRID_SHAPE;
                     }
                     
