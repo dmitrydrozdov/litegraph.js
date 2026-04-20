@@ -4,9 +4,13 @@ npm-debug.log
 temp/
 temp/*
 coverage/
+build/
 
 # Editors
 /.vscode/*
 !/.vscode/extensions.json
 *.bak
 .project
+.claude
+.codex
+openspec

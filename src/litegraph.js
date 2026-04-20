@@ -89,10 +89,23 @@
         RIGHT: 4,
         CENTER: 5,
 
-        LINK_RENDER_MODES: ["Straight", "Linear", "Spline"], // helper
+        LINK_RENDER_MODES: Object.assign(
+            ["Straight", "Linear", "Spline", "Orthogonal"], // helper
+            { STRAIGHT_LINK: 0, LINEAR_LINK: 1, SPLINE_LINK: 2, ORTHOGONAL_LINK: 3 }
+        ),
         STRAIGHT_LINK: 0,
         LINEAR_LINK: 1,
         SPLINE_LINK: 2,
+        ORTHOGONAL_LINK: 3,
+
+        // Orthogonal router tuning
+        LINK_ORTHOGONAL_PADDING: 8, // obstacle inflation (graph px)
+        LINK_ORTHOGONAL_CORNER_RADIUS: 8, // max fillet radius (graph px)
+        LINK_ORTHOGONAL_TURN_COST: 10, // A* cost per 90° turn
+        LINK_ORTHOGONAL_CROSSING_COST: 50, // A* cost per crossing with an already-routed link
+        LINK_ORTHOGONAL_PARALLEL_OFFSET: 12, // perpendicular stub offset per parallel link
+        LINK_ORTHOGONAL_STUB_LENGTH: 18, // minimum length of the straight stub leaving/entering a node slot (graph px; default = NODE_SLOT_HEIGHT/2 + LINK_ORTHOGONAL_PADDING)
+        LINK_ORTHOGONAL_STABILITY_BIAS: 0.001, // tiny per-edge penalty for deviating from the previous route — breaks cost ties in favor of the previous path, eliminating flicker between equal-cost routes during drags
 
         NORMAL_TITLE: 0,
         NO_TITLE: 1,
@@ -1649,6 +1662,13 @@
             this.onNodeAdded(node);
         }
 
+        //invalidate orthogonal routes on attached canvases
+        if (this.list_of_graphcanvas) {
+            for (var ci = 0; ci < this.list_of_graphcanvas.length; ++ci) {
+                this.list_of_graphcanvas[ci]._route_version++;
+            }
+        }
+
         this.setDirtyCanvas(true);
         this.change();
 
@@ -1725,6 +1745,7 @@
                 if (canvas.node_dragged == node) {
                     canvas.node_dragged = null;
                 }
+                canvas._route_version++;
             }
         }
 
@@ -5638,6 +5659,10 @@ LGraphNode.prototype.executeAction = function(action)
         this.visible_area = this.ds.visible_area;
         this.visible_links = [];
 
+        //orthogonal router cache bookkeeping
+        this._route_version = 0;
+        this._last_render_mode = this.links_render_mode;
+
 		this.viewport = options.viewport || null; //to constraint render area to a portion of the canvas
 
         //link canvas and graph
@@ -6823,8 +6848,42 @@ LGraphNode.prototype.executeAction = function(action)
 
                 //search for link connector
 				var over_link = null;
+				var _hit_thresh = 4 / this.ds.scale;
+				var _hit_pt = [e.canvasX, e.canvasY];
 				for (var i = 0; i < this.visible_links.length; ++i) {
 					var link = this.visible_links[i];
+					//polyline-based hit test (orthogonal / any cached polyline)
+					if (link._polyline && link._polyline.length >= 4) {
+						//coarse bbox reject first
+						var poly = link._polyline;
+						var pn = poly.length / 2;
+						var pminx = poly[0], pminy = poly[1], pmaxx = poly[0], pmaxy = poly[1];
+						for (var pp = 1; pp < pn; pp++) {
+							var px = poly[pp * 2], py = poly[pp * 2 + 1];
+							if (px < pminx) pminx = px;
+							if (px > pmaxx) pmaxx = px;
+							if (py < pminy) pminy = py;
+							if (py > pmaxy) pmaxy = py;
+						}
+						if (e.canvasX < pminx - _hit_thresh ||
+							e.canvasX > pmaxx + _hit_thresh ||
+							e.canvasY < pminy - _hit_thresh ||
+							e.canvasY > pmaxy + _hit_thresh) {
+							continue;
+						}
+						var hit = false;
+						for (var ps = 0; ps < pn - 1; ps++) {
+							var a1 = [poly[ps * 2], poly[ps * 2 + 1]];
+							var a2 = [poly[(ps + 1) * 2], poly[(ps + 1) * 2 + 1]];
+							if (pointToSegmentDistance(_hit_pt, a1, a2) <= _hit_thresh) {
+								hit = true; break;
+							}
+						}
+						if (!hit) continue;
+						over_link = link;
+						break;
+					}
+					//legacy fallback: circle around link._pos
 					var center = link._pos;
 					if (
 						!center ||
@@ -6866,6 +6925,7 @@ LGraphNode.prototype.executeAction = function(action)
                      * Otherwise, it could cause the block to be unselected while dragging.
                      */
                 }
+                this._route_version++;
 
                 this.dirty_canvas = true;
                 this.dirty_bgcanvas = true;
@@ -9606,6 +9666,25 @@ LGraphNode.prototype.executeAction = function(action)
         ctx.fillStyle = "#AAA";
         ctx.strokeStyle = "#AAA";
         ctx.globalAlpha = this.editor_alpha;
+
+        //invalidate orthogonal caches when mode changes (in either direction)
+        if (this._last_render_mode !== this.links_render_mode) {
+            this._route_version++;
+            if (this._last_render_mode === LiteGraph.ORTHOGONAL_LINK) {
+                //leaving ORTHOGONAL mode: drop stale polylines so legacy hit-test path kicks in
+                var all_links = this.graph.links;
+                for (var lk in all_links) {
+                    if (all_links[lk]) all_links[lk]._polyline = null;
+                }
+            }
+            this._last_render_mode = this.links_render_mode;
+        }
+
+        //orthogonal mode: run the router once per frame before draw-time stroking
+        if (this.links_render_mode === LiteGraph.ORTHOGONAL_LINK) {
+            this._routeOrthogonalLinks();
+        }
+
         //for every node
         var nodes = this.graph._nodes;
         for (var n = 0, l = nodes.length; n < l; ++n) {
@@ -9722,6 +9801,161 @@ LGraphNode.prototype.executeAction = function(action)
     };
 
     /**
+     * Orthogonal router per-frame pre-pass.
+     * Collects all visible links, sorts by link.id, computes obstacles,
+     * routes each in order (cache-aware), stores resulting polyline on link._polyline.
+     * @method _routeOrthogonalLinks
+     */
+    LGraphCanvas.prototype._routeOrthogonalLinks = function() {
+        var graph = this.graph;
+        if (!graph) return;
+        var nodes = graph._nodes;
+        if (!nodes || !nodes.length) return;
+
+        var padding = LiteGraph.LINK_ORTHOGONAL_PADDING;
+
+        //collect all link routing records by iterating inputs (same order as drawConnections)
+        var records = [];
+        var pair_counts = {};
+        var tmpA = new Float32Array(2);
+        var tmpB = new Float32Array(2);
+        for (var n = 0; n < nodes.length; n++) {
+            var node = nodes[n];
+            if (!node.inputs || !node.inputs.length) continue;
+            for (var i = 0; i < node.inputs.length; i++) {
+                var input = node.inputs[i];
+                if (!input) continue;
+                var input_links = getInputLinks(input);
+                if (!input_links || !input_links.length) continue;
+                for (var j = 0; j < input_links.length; j++) {
+                    var link_id = input_links[j];
+                    var link = graph.links[link_id];
+                    if (!link) continue;
+                    var start_node = graph.getNodeById(link.origin_id);
+                    if (!start_node) continue;
+                    if (link.origin_slot === -1) continue; //weird case
+                    var start_slot = start_node.outputs && start_node.outputs[link.origin_slot];
+                    var end_slot = input;
+                    if (!start_slot || !end_slot) continue;
+                    records.push({
+                        link: link,
+                        start_node: start_node,
+                        end_node: node,
+                        start_slot_idx: link.origin_slot,
+                        end_slot_idx: i,
+                        start_slot: start_slot,
+                        end_slot: end_slot
+                    });
+                    var pair_key = link.origin_id + ">" + link.target_id;
+                    pair_counts[pair_key] = (pair_counts[pair_key] || 0) + 1;
+                }
+            }
+        }
+
+        //sort by link.id ascending (stable across frames)
+        records.sort(function(a, b) {
+            var aid = a.link.id, bid = b.link.id;
+            if (typeof aid === "string" || typeof bid === "string") {
+                aid = String(aid); bid = String(bid);
+                return aid < bid ? -1 : (aid > bid ? 1 : 0);
+            }
+            return aid - bid;
+        });
+
+        //compute pair indices (per link.id order inside each pair)
+        var pair_cursor = {};
+        for (var r = 0; r < records.length; r++) {
+            var rec = records[r];
+            var pk = rec.link.origin_id + ">" + rec.link.target_id;
+            rec.pair_count = pair_counts[pk];
+            rec.pair_idx = pair_cursor[pk] || 0;
+            pair_cursor[pk] = rec.pair_idx + 1;
+            var off = 0;
+            if (rec.pair_count > 1) {
+                off = (rec.pair_idx - (rec.pair_count - 1) / 2) * LiteGraph.LINK_ORTHOGONAL_PARALLEL_OFFSET;
+            }
+            rec.origin_offset = off;
+            //origin.perp and target.perp point opposite on aligned slot axes
+            //(e.g. RIGHT output vs LEFT input), so flipping the target sign keeps
+            //both stub shifts aligned in screen space — parallel links stay parallel.
+            rec.target_offset = -off;
+        }
+
+        var already_routed = [];
+
+        for (var k = 0; k < records.length; k++) {
+            var rec2 = records[k];
+            var link2 = rec2.link;
+
+            //get slot positions (copy, since getConnectionPos uses shared tmp buffers)
+            var o_slot_pos_buf = rec2.start_node.getConnectionPos(false, rec2.start_slot_idx, tmpA);
+            var o_slot_pos = [o_slot_pos_buf[0], o_slot_pos_buf[1]];
+            var t_slot_pos_buf = rec2.end_node.getConnectionPos(true, rec2.end_slot_idx, tmpB);
+            var t_slot_pos = [t_slot_pos_buf[0], t_slot_pos_buf[1]];
+
+            var start_dir = rec2.start_slot.dir ||
+                (rec2.start_node.horizontal ? LiteGraph.DOWN : LiteGraph.RIGHT);
+            var end_dir = rec2.end_slot.dir ||
+                (rec2.end_node.horizontal ? LiteGraph.UP : LiteGraph.LEFT);
+
+            //cache check
+            var cache_ok = link2._polyline && link2._polyline.length >= 4 &&
+                           link2._route_version === this._route_version &&
+                           link2._route_mode === LiteGraph.ORTHOGONAL_LINK &&
+                           link2._route_origin_offset === rec2.origin_offset &&
+                           link2._route_target_offset === rec2.target_offset;
+            if (cache_ok) {
+                already_routed.push(link2._polyline);
+                continue;
+            }
+
+            //neighborhood bbox around stub tips with extra padding for obstacle filtering
+            var stubLen = LiteGraph.LINK_ORTHOGONAL_STUB_LENGTH;
+            var odv = _orthoDirVec(start_dir);
+            var tdv = _orthoDirVec(end_dir);
+            var o_tip_x = o_slot_pos[0] + odv[0] * stubLen;
+            var o_tip_y = o_slot_pos[1] + odv[1] * stubLen;
+            var t_tip_x = t_slot_pos[0] + tdv[0] * stubLen;
+            var t_tip_y = t_slot_pos[1] + tdv[1] * stubLen;
+            var minx = Math.min(o_tip_x, t_tip_x) - padding - 32;
+            var miny = Math.min(o_tip_y, t_tip_y) - padding - 32;
+            var maxx = Math.max(o_tip_x, t_tip_x) + padding + 32;
+            var maxy = Math.max(o_tip_y, t_tip_y) + padding + 32;
+            var neighborhood = [minx, miny, maxx - minx, maxy - miny];
+
+            //All nodes are obstacles, including the two endpoints.
+            //The stub tip sits at stubLen beyond the node edge, which is
+            //(stubLen - padding) px outside the inflated bbox — as long as
+            //LINK_ORTHOGONAL_STUB_LENGTH > LINK_ORTHOGONAL_PADDING, A* starts
+            //just outside the obstacle and can route around cleanly.
+            //Self-loops: include the node once (same behavior).
+            var obstacles = _orthoBuildObstacles(graph, {}, neighborhood, padding);
+
+            //On cache miss, link2._polyline still holds the previous route (if any).
+            //Pass it to bias A* toward reusing segments when costs tie.
+            var prev_polyline = link2._polyline;
+
+            var polyline = this.routeOrthogonalLink(
+                o_slot_pos, start_dir, rec2.origin_offset,
+                t_slot_pos, end_dir, rec2.target_offset,
+                obstacles, already_routed, prev_polyline
+            );
+
+            link2._polyline = polyline;
+            link2._route_version = this._route_version;
+            link2._route_mode = LiteGraph.ORTHOGONAL_LINK;
+            link2._route_origin_offset = rec2.origin_offset;
+            link2._route_target_offset = rec2.target_offset;
+            if (link2._pos) {
+                var mid = _orthoPolylineMidpoint(polyline);
+                link2._pos[0] = mid[0];
+                link2._pos[1] = mid[1];
+            }
+            already_routed.push(polyline);
+        }
+    };
+
+    /**
      * draws a link between two points
      * @method renderLink
      * @param {vec2} a start pos
@@ -9777,10 +10011,37 @@ LGraphNode.prototype.executeAction = function(action)
 
         //begin line shape
         ctx.beginPath();
+
+        //orthogonal mode strokes the pre-computed cached polyline with rounded corners
+        var _ortho_drawn = false;
+        if (
+            this.links_render_mode === LiteGraph.ORTHOGONAL_LINK &&
+            link && link._polyline && link._polyline.length >= 4
+        ) {
+            this.strokeRoundedPolyline(
+                ctx,
+                link._polyline,
+                LiteGraph.LINK_ORTHOGONAL_CORNER_RADIUS
+            );
+            _ortho_drawn = true;
+        }
+
+        //fallback for unknown modes: default to SPLINE_LINK
+        var _render_mode = this.links_render_mode;
+        if (
+            _render_mode !== LiteGraph.STRAIGHT_LINK &&
+            _render_mode !== LiteGraph.LINEAR_LINK &&
+            _render_mode !== LiteGraph.SPLINE_LINK &&
+            _render_mode !== LiteGraph.ORTHOGONAL_LINK
+        ) {
+            _render_mode = LiteGraph.SPLINE_LINK;
+        }
+
         for (var i = 0; i < num_sublines; i += 1) {
+            if (_ortho_drawn) break;
             var offsety = (i - (num_sublines - 1) * 0.5) * 5;
 
-            if (this.links_render_mode == LiteGraph.SPLINE_LINK) {
+            if (_render_mode == LiteGraph.SPLINE_LINK || _render_mode == LiteGraph.ORTHOGONAL_LINK) {
                 ctx.moveTo(a[0], a[1] + offsety);
                 var start_offset_x = 0;
                 var start_offset_y = 0;
@@ -9822,7 +10083,7 @@ LGraphNode.prototype.executeAction = function(action)
                     b[0],
                     b[1] + offsety
                 );
-            } else if (this.links_render_mode == LiteGraph.LINEAR_LINK) {
+            } else if (_render_mode == LiteGraph.LINEAR_LINK) {
                 ctx.moveTo(a[0], a[1] + offsety);
                 var start_offset_x = 0;
                 var start_offset_y = 0;
@@ -9866,7 +10127,7 @@ LGraphNode.prototype.executeAction = function(action)
                     b[1] + end_offset_y * l + offsety
                 );
                 ctx.lineTo(b[0], b[1] + offsety);
-            } else if (this.links_render_mode == LiteGraph.STRAIGHT_LINK) {
+            } else if (_render_mode == LiteGraph.STRAIGHT_LINK) {
                 ctx.moveTo(a[0], a[1]);
                 var start_x = a[0];
                 var start_y = a[1];
@@ -9887,9 +10148,7 @@ LGraphNode.prototype.executeAction = function(action)
                 ctx.lineTo((start_x + end_x) * 0.5, end_y);
                 ctx.lineTo(end_x, end_y);
                 ctx.lineTo(b[0], b[1]);
-            } else {
-                return;
-            } //unknown
+            }
         }
 
         //rendering the outline of the connection can be a little bit slow
@@ -9907,7 +10166,12 @@ LGraphNode.prototype.executeAction = function(action)
         ctx.stroke();
         //end line shape
 
-        var pos = this.computeConnectionPoint(a, b, 0.5, start_dir, end_dir);
+        var pos;
+        if (_ortho_drawn) {
+            pos = _orthoPolylineMidpoint(link._polyline);
+        } else {
+            pos = this.computeConnectionPoint(a, b, 0.5, start_dir, end_dir);
+        }
         if (link && link._pos) {
             link._pos[0] = pos[0];
             link._pos[1] = pos[1];
@@ -9919,8 +10183,8 @@ LGraphNode.prototype.executeAction = function(action)
             this.highquality_render &&
             end_dir != LiteGraph.CENTER
         ) {
-            //render arrow
-            if (this.render_connection_arrows) {
+            //render arrow (arrows use bezier interpolation, not compatible with orthogonal polylines)
+            if (this.render_connection_arrows && !_ortho_drawn) {
                 //compute two points in the connection
                 var posA = this.computeConnectionPoint(
                     a,
@@ -9989,7 +10253,7 @@ LGraphNode.prototype.executeAction = function(action)
         }
 
         //render flowing points
-        if (flow) {
+        if (flow && !_ortho_drawn) {
             ctx.fillStyle = color;
             for (var i = 0; i < 5; ++i) {
                 var f = (LiteGraph.getTime() * 0.001 + i * 0.2) % 1;
@@ -10005,6 +10269,525 @@ LGraphNode.prototype.executeAction = function(action)
                 ctx.fill();
             }
         }
+    };
+
+    // ====================================================================
+    // Orthogonal link router (LINK_RENDER_MODES.ORTHOGONAL_LINK)
+    // ====================================================================
+
+    function _orthoDirVec(dir) {
+        if (dir === LiteGraph.RIGHT) return [1, 0];
+        if (dir === LiteGraph.LEFT) return [-1, 0];
+        if (dir === LiteGraph.DOWN) return [0, 1];
+        if (dir === LiteGraph.UP) return [0, -1];
+        return [0, 0];
+    }
+
+    function _orthoVecToDir(vx, vy) {
+        if (vx > 0) return LiteGraph.RIGHT;
+        if (vx < 0) return LiteGraph.LEFT;
+        if (vy > 0) return LiteGraph.DOWN;
+        if (vy < 0) return LiteGraph.UP;
+        return 0;
+    }
+
+    // Axis-aligned segment intersection (proper crossing only, no parallel overlap).
+    function segmentsIntersect(a1, a2, b1, b2) {
+        var aHoriz = a1[1] === a2[1];
+        var bHoriz = b1[1] === b2[1];
+        if (aHoriz === bHoriz) return false;
+        var h1 = aHoriz ? a1 : b1;
+        var h2 = aHoriz ? a2 : b2;
+        var v1 = aHoriz ? b1 : a1;
+        var v2 = aHoriz ? b2 : a2;
+        var hy = h1[1];
+        var vx = v1[0];
+        var hMinX = h1[0] < h2[0] ? h1[0] : h2[0];
+        var hMaxX = h1[0] > h2[0] ? h1[0] : h2[0];
+        var vMinY = v1[1] < v2[1] ? v1[1] : v2[1];
+        var vMaxY = v1[1] > v2[1] ? v1[1] : v2[1];
+        return (vx > hMinX && vx < hMaxX && hy > vMinY && hy < vMaxY);
+    }
+    LiteGraph.segmentsIntersect = segmentsIntersect;
+
+    // True iff axis-aligned segment p1-p2 crosses the open interior of rect [x,y,w,h].
+    // Touching an edge is legal (treated as non-crossing).
+    function segmentCrossesRect(p1, p2, rect) {
+        var rx1 = rect[0], ry1 = rect[1];
+        var rx2 = rx1 + rect[2], ry2 = ry1 + rect[3];
+        if (p1[0] === p2[0]) {
+            var x = p1[0];
+            if (x <= rx1 || x >= rx2) return false;
+            var pmin = p1[1] < p2[1] ? p1[1] : p2[1];
+            var pmax = p1[1] > p2[1] ? p1[1] : p2[1];
+            return !(pmax <= ry1 || pmin >= ry2);
+        }
+        var y = p1[1];
+        if (y <= ry1 || y >= ry2) return false;
+        var pmin = p1[0] < p2[0] ? p1[0] : p2[0];
+        var pmax = p1[0] > p2[0] ? p1[0] : p2[0];
+        return !(pmax <= rx1 || pmin >= rx2);
+    }
+    LiteGraph.segmentCrossesRect = segmentCrossesRect;
+
+    function pointToSegmentDistance(p, a, b) {
+        var dx = b[0] - a[0];
+        var dy = b[1] - a[1];
+        var len2 = dx * dx + dy * dy;
+        if (len2 === 0) {
+            var ddx = p[0] - a[0], ddy = p[1] - a[1];
+            return Math.sqrt(ddx * ddx + ddy * ddy);
+        }
+        var t = ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / len2;
+        if (t < 0) t = 0; else if (t > 1) t = 1;
+        var qx = a[0] + t * dx;
+        var qy = a[1] + t * dy;
+        var ex = p[0] - qx, ey = p[1] - qy;
+        return Math.sqrt(ex * ex + ey * ey);
+    }
+    LiteGraph.pointToSegmentDistance = pointToSegmentDistance;
+
+    function _orthoSegmentBlocked(p1, p2, obstacles) {
+        for (var i = 0; i < obstacles.length; i++) {
+            if (segmentCrossesRect(p1, p2, obstacles[i])) return true;
+        }
+        return false;
+    }
+
+    function _orthoCountCrossings(p1, p2, already_routed) {
+        var count = 0;
+        for (var i = 0; i < already_routed.length; i++) {
+            var poly = already_routed[i];
+            if (!poly || poly.length < 4) continue;
+            for (var j = 0; j < poly.length - 2; j += 2) {
+                var q1x = poly[j],     q1y = poly[j + 1];
+                var q2x = poly[j + 2], q2y = poly[j + 3];
+                if (segmentsIntersect(p1, p2, [q1x, q1y], [q2x, q2y])) count++;
+            }
+        }
+        return count;
+    }
+
+    function _orthoBuildObstacles(graph, excluded_ids, neighborhood, padding) {
+        var out = [];
+        var nodes = graph._nodes;
+        var tmp = new Float32Array(4);
+        for (var i = 0; i < nodes.length; i++) {
+            var n = nodes[i];
+            if (excluded_ids[n.id]) continue;
+            n.getBounding(tmp, false);
+            var rx = tmp[0] - padding;
+            var ry = tmp[1] - padding;
+            var rw = tmp[2] + padding * 2;
+            var rh = tmp[3] + padding * 2;
+            if (neighborhood) {
+                if (rx + rw <= neighborhood[0]) continue;
+                if (ry + rh <= neighborhood[1]) continue;
+                if (rx >= neighborhood[0] + neighborhood[2]) continue;
+                if (ry >= neighborhood[1] + neighborhood[3]) continue;
+            }
+            out.push([rx, ry, rw, rh]);
+        }
+        return out;
+    }
+
+    function _orthoBuildHananGrid(endpoints, obstacles, extra_rects) {
+        var xs = {};
+        var ys = {};
+        for (var i = 0; i < endpoints.length; i++) {
+            xs[endpoints[i][0]] = true;
+            ys[endpoints[i][1]] = true;
+        }
+        for (var j = 0; j < obstacles.length; j++) {
+            var o = obstacles[j];
+            xs[o[0]] = true;
+            xs[o[0] + o[2]] = true;
+            ys[o[1]] = true;
+            ys[o[1] + o[3]] = true;
+        }
+        //extra_rects contribute coordinates only — they are NOT obstacles.
+        //Used so the Hanan grid has turn points around endpoint nodes even though
+        //the router is allowed to cross them.
+        if (extra_rects) {
+            for (var k = 0; k < extra_rects.length; k++) {
+                var r = extra_rects[k];
+                if (!r) continue;
+                xs[r[0]] = true;
+                xs[r[0] + r[2]] = true;
+                ys[r[1]] = true;
+                ys[r[1] + r[3]] = true;
+            }
+        }
+        var xArr = Object.keys(xs).map(Number).sort(function(a, b) { return a - b; });
+        var yArr = Object.keys(ys).map(Number).sort(function(a, b) { return a - b; });
+        return { xs: xArr, ys: yArr };
+    }
+
+    function _orthoHeapPush(heap, item) {
+        heap.push(item);
+        var i = heap.length - 1;
+        while (i > 0) {
+            var parent = (i - 1) >> 1;
+            if (heap[parent].f > heap[i].f) {
+                var t = heap[parent]; heap[parent] = heap[i]; heap[i] = t;
+                i = parent;
+            } else break;
+        }
+    }
+
+    function _orthoHeapPop(heap) {
+        var top = heap[0];
+        var last = heap.pop();
+        if (heap.length) {
+            heap[0] = last;
+            var i = 0, n = heap.length;
+            for (;;) {
+                var l = i * 2 + 1, r = i * 2 + 2, s = i;
+                if (l < n && heap[l].f < heap[s].f) s = l;
+                if (r < n && heap[r].f < heap[s].f) s = r;
+                if (s === i) break;
+                var t = heap[s]; heap[s] = heap[i]; heap[i] = t;
+                i = s;
+            }
+        }
+        return top;
+    }
+
+    //directions: 0=RIGHT, 1=LEFT, 2=DOWN, 3=UP
+    var _ORTHO_DIR_DX = [1, -1, 0, 0];
+    var _ORTHO_DIR_DY = [0, 0, 1, -1];
+    var _ORTHO_DIR_CONST = [LiteGraph.RIGHT, LiteGraph.LEFT, LiteGraph.DOWN, LiteGraph.UP];
+    var _ORTHO_DIR_OPPOSITE = [1, 0, 3, 2];
+
+    function _orthoDirIndex(dir) {
+        for (var i = 0; i < 4; i++) if (_ORTHO_DIR_CONST[i] === dir) return i;
+        return 0;
+    }
+
+    //Is the axis-aligned segment (x1,y1)-(x2,y2) fully contained inside any
+    //segment of the previous polyline? Used for a tiny tie-break bias so the
+    //router prefers to reuse the previous path when costs are equal.
+    function _orthoEdgeOnPrev(x1, y1, x2, y2, prev_segs) {
+        if (!prev_segs || !prev_segs.length) return false;
+        var horiz = (y1 === y2);
+        for (var i = 0; i < prev_segs.length; i++) {
+            var s = prev_segs[i];
+            var sHoriz = (s[1] === s[3]);
+            if (sHoriz !== horiz) continue;
+            if (horiz) {
+                if (y1 !== s[1]) continue;
+                var sMin = s[0] < s[2] ? s[0] : s[2];
+                var sMax = s[0] > s[2] ? s[0] : s[2];
+                var eMin = x1 < x2 ? x1 : x2;
+                var eMax = x1 > x2 ? x1 : x2;
+                if (eMin >= sMin && eMax <= sMax) return true;
+            } else {
+                if (x1 !== s[0]) continue;
+                var sMin2 = s[1] < s[3] ? s[1] : s[3];
+                var sMax2 = s[1] > s[3] ? s[1] : s[3];
+                var eMin2 = y1 < y2 ? y1 : y2;
+                var eMax2 = y1 > y2 ? y1 : y2;
+                if (eMin2 >= sMin2 && eMax2 <= sMax2) return true;
+            }
+        }
+        return false;
+    }
+
+    function _orthoAStar(o_tip, init_dir, t_tip, forbidden_arrivals, xs, ys, obstacles, already_routed, prev_segs) {
+        var W = xs.length, H = ys.length;
+        var sx = -1, sy = -1, gx = -1, gy = -1;
+        for (var i = 0; i < W; i++) {
+            if (xs[i] === o_tip[0]) sx = i;
+            if (xs[i] === t_tip[0]) gx = i;
+        }
+        for (var j = 0; j < H; j++) {
+            if (ys[j] === o_tip[1]) sy = j;
+            if (ys[j] === t_tip[1]) gy = j;
+        }
+        if (sx < 0 || sy < 0 || gx < 0 || gy < 0) return null;
+
+        var startDi = _orthoDirIndex(init_dir);
+        var forbiddenSet = [false, false, false, false];
+        if (forbidden_arrivals) {
+            for (var fi = 0; fi < forbidden_arrivals.length; fi++) {
+                var d = forbidden_arrivals[fi];
+                if (d) forbiddenSet[_orthoDirIndex(d)] = true;
+            }
+        }
+
+        var closed = {};
+        var best = {};
+
+        function key(xi, yi, di) { return (xi * H + yi) * 4 + di; }
+        function heur(xi, yi) {
+            return Math.abs(xs[xi] - xs[gx]) + Math.abs(ys[yi] - ys[gy]);
+        }
+
+        var heap = [];
+        var startNode = { xi: sx, yi: sy, di: startDi, g: 0, f: heur(sx, sy), parent: null };
+        best[key(sx, sy, startDi)] = 0;
+        _orthoHeapPush(heap, startNode);
+
+        var turnCost = LiteGraph.LINK_ORTHOGONAL_TURN_COST;
+        var crossCost = LiteGraph.LINK_ORTHOGONAL_CROSSING_COST;
+
+        while (heap.length) {
+            var cur = _orthoHeapPop(heap);
+            var ck = key(cur.xi, cur.yi, cur.di);
+            if (closed[ck]) continue;
+            closed[ck] = true;
+
+            if (cur.xi === gx && cur.yi === gy && !forbiddenSet[cur.di]) {
+                return cur;
+            }
+
+            for (var nd = 0; nd < 4; nd++) {
+                if (nd === _ORTHO_DIR_OPPOSITE[cur.di]) continue; //no U-turns
+                var nxi = cur.xi + _ORTHO_DIR_DX[nd];
+                var nyi = cur.yi + _ORTHO_DIR_DY[nd];
+                if (nxi < 0 || nxi >= W || nyi < 0 || nyi >= H) continue;
+
+                //no self-crossings: skip any move that lands on a grid vertex already
+                //on the current path. Because all segments are axis-aligned on the Hanan
+                //grid, self-crossings can only occur at grid vertices — so rejecting
+                //same-vertex revisits rejects all geometric self-crossings.
+                var revisit = false;
+                for (var anc = cur; anc; anc = anc.parent) {
+                    if (anc.xi === nxi && anc.yi === nyi) { revisit = true; break; }
+                }
+                if (revisit) continue;
+
+                var p1 = [xs[cur.xi], ys[cur.yi]];
+                var p2 = [xs[nxi], ys[nyi]];
+                if (_orthoSegmentBlocked(p1, p2, obstacles)) continue;
+
+                var segLen = Math.abs(p2[0] - p1[0]) + Math.abs(p2[1] - p1[1]);
+                var tc = (nd !== cur.di) ? turnCost : 0;
+                var cc = crossCost * _orthoCountCrossings(p1, p2, already_routed);
+                //tiny bias: edges that deviate from the previous polyline pay a small
+                //penalty, so equal-cost alternatives resolve in favor of the previous route
+                var sb = (prev_segs && !_orthoEdgeOnPrev(p1[0], p1[1], p2[0], p2[1], prev_segs))
+                    ? LiteGraph.LINK_ORTHOGONAL_STABILITY_BIAS : 0;
+                var newG = cur.g + segLen + tc + cc + sb;
+                var nk = key(nxi, nyi, nd);
+                if (best[nk] != null && best[nk] <= newG) continue;
+                best[nk] = newG;
+                _orthoHeapPush(heap, {
+                    xi: nxi, yi: nyi, di: nd,
+                    g: newG, f: newG + heur(nxi, nyi),
+                    parent: cur
+                });
+            }
+        }
+        return null;
+    }
+
+    function _orthoLRouteFallback(o_tip, o_dir, t_tip) {
+        //Detect the degenerate case where a single-corner L would double back
+        //through the source stub (target lies on the opposite side of the slot_dir axis).
+        //In that case, emit a Z-route (two corners) so the stub isn't collapsed during merge.
+        var horizontal = (o_dir === LiteGraph.LEFT || o_dir === LiteGraph.RIGHT);
+        var backward;
+        if (o_dir === LiteGraph.RIGHT)      backward = (t_tip[0] < o_tip[0]);
+        else if (o_dir === LiteGraph.LEFT)  backward = (t_tip[0] > o_tip[0]);
+        else if (o_dir === LiteGraph.DOWN)  backward = (t_tip[1] < o_tip[1]);
+        else                                 backward = (t_tip[1] > o_tip[1]);
+
+        if (backward) {
+            //Z-route: move perpendicular to slot_dir first, then across to the target's axis, then to the target.
+            if (horizontal) {
+                var midY = t_tip[1];
+                if (midY === o_tip[1]) midY += LiteGraph.LINK_ORTHOGONAL_STUB_LENGTH;
+                return [
+                    [o_tip[0], o_tip[1]],
+                    [o_tip[0], midY],
+                    [t_tip[0], midY],
+                    [t_tip[0], t_tip[1]]
+                ];
+            }
+            var midX = t_tip[0];
+            if (midX === o_tip[0]) midX += LiteGraph.LINK_ORTHOGONAL_STUB_LENGTH;
+            return [
+                [o_tip[0], o_tip[1]],
+                [midX, o_tip[1]],
+                [midX, t_tip[1]],
+                [t_tip[0], t_tip[1]]
+            ];
+        }
+
+        var corner = horizontal
+            ? [t_tip[0], o_tip[1]]
+            : [o_tip[0], t_tip[1]];
+        var same_as_o = (corner[0] === o_tip[0] && corner[1] === o_tip[1]);
+        var same_as_t = (corner[0] === t_tip[0] && corner[1] === t_tip[1]);
+        if (same_as_o || same_as_t) {
+            return [[o_tip[0], o_tip[1]], [t_tip[0], t_tip[1]]];
+        }
+        return [[o_tip[0], o_tip[1]], corner, [t_tip[0], t_tip[1]]];
+    }
+
+    function _orthoCleanPolyline(points) {
+        //drop consecutive duplicates then merge collinear runs
+        var dedup = [];
+        for (var i = 0; i < points.length; i++) {
+            var p = points[i];
+            if (dedup.length === 0) { dedup.push(p); continue; }
+            var last = dedup[dedup.length - 1];
+            if (p[0] === last[0] && p[1] === last[1]) continue;
+            dedup.push(p);
+        }
+        var merged = [];
+        for (var k = 0; k < dedup.length; k++) {
+            if (merged.length < 2) { merged.push(dedup[k]); continue; }
+            var a = merged[merged.length - 2];
+            var b = merged[merged.length - 1];
+            var c = dedup[k];
+            var collinear = (a[0] === b[0] && b[0] === c[0]) || (a[1] === b[1] && b[1] === c[1]);
+            if (collinear) merged[merged.length - 1] = c;
+            else merged.push(c);
+        }
+        return merged;
+    }
+
+    function _orthoPolylineToFloat32(points) {
+        var arr = new Float32Array(points.length * 2);
+        for (var i = 0; i < points.length; i++) {
+            arr[i * 2] = points[i][0];
+            arr[i * 2 + 1] = points[i][1];
+        }
+        return arr;
+    }
+
+    function _orthoPolylineMidpoint(polyline) {
+        var n = polyline.length / 2;
+        if (n === 0) return [0, 0];
+        if (n === 1) return [polyline[0], polyline[1]];
+        var total = 0;
+        for (var i = 0; i < n - 1; i++) {
+            var dx = polyline[(i + 1) * 2] - polyline[i * 2];
+            var dy = polyline[(i + 1) * 2 + 1] - polyline[i * 2 + 1];
+            total += Math.sqrt(dx * dx + dy * dy);
+        }
+        var half = total * 0.5;
+        var traveled = 0;
+        for (var j = 0; j < n - 1; j++) {
+            var dx2 = polyline[(j + 1) * 2] - polyline[j * 2];
+            var dy2 = polyline[(j + 1) * 2 + 1] - polyline[j * 2 + 1];
+            var L = Math.sqrt(dx2 * dx2 + dy2 * dy2);
+            if (L === 0) continue;
+            if (traveled + L >= half) {
+                var t = (half - traveled) / L;
+                return [polyline[j * 2] + dx2 * t, polyline[j * 2 + 1] + dy2 * t];
+            }
+            traveled += L;
+        }
+        return [polyline[(n - 1) * 2], polyline[(n - 1) * 2 + 1]];
+    }
+    LiteGraph.polylineMidpoint = _orthoPolylineMidpoint;
+
+    /**
+     * Routes an orthogonal polyline between two slots and returns it as Float32Array.
+     * The returned polyline is axis-aligned, sharp-cornered, with merged collinear vertices.
+     * @method routeOrthogonalLink
+     */
+    LGraphCanvas.prototype.routeOrthogonalLink = function(
+        origin_slot_pos, origin_slot_dir, origin_offset,
+        target_slot_pos, target_slot_dir, target_offset,
+        obstacles, already_routed, prev_polyline
+    ) {
+        var stubLen = LiteGraph.LINK_ORTHOGONAL_STUB_LENGTH;
+        var odv = _orthoDirVec(origin_slot_dir || LiteGraph.RIGHT);
+        var operp = [-odv[1], odv[0]];
+        var o_base = [origin_slot_pos[0] + odv[0] * stubLen, origin_slot_pos[1] + odv[1] * stubLen];
+        var o_tip = [o_base[0] + operp[0] * origin_offset, o_base[1] + operp[1] * origin_offset];
+
+        var tdv = _orthoDirVec(target_slot_dir || LiteGraph.LEFT);
+        var tperp = [-tdv[1], tdv[0]];
+        var t_base = [target_slot_pos[0] + tdv[0] * stubLen, target_slot_pos[1] + tdv[1] * stubLen];
+        var t_tip = [t_base[0] + tperp[0] * target_offset, t_base[1] + tperp[1] * target_offset];
+
+        //A*'s "incoming direction" at o_tip is pinned to slot_dir so the U-turn check
+        //forbids any first move back toward/through the source node, regardless of offset.
+        var initDir = origin_slot_dir || LiteGraph.RIGHT;
+
+        //forbidden arrival directions at t_tip:
+        //  - always forbid +slot_dir (arriving from inside/behind the target node),
+        //  - when offset != 0, also forbid the jog-reverse (would U-turn against t_tip→t_base).
+        var forbiddenArrivals = [target_slot_dir || LiteGraph.LEFT];
+        if (target_offset !== 0) {
+            forbiddenArrivals.push(_orthoVecToDir(t_tip[0] - t_base[0], t_tip[1] - t_base[1]));
+        }
+
+        var grid = _orthoBuildHananGrid([o_tip, t_tip], obstacles);
+
+        //Precompute the previous polyline's segments for the stability bias.
+        //prev_polyline is a Float32Array of interleaved xy (or falsy for a first route).
+        var prev_segs = null;
+        if (prev_polyline && prev_polyline.length >= 4) {
+            prev_segs = [];
+            for (var ps = 0; ps < prev_polyline.length - 2; ps += 2) {
+                prev_segs.push([
+                    prev_polyline[ps],     prev_polyline[ps + 1],
+                    prev_polyline[ps + 2], prev_polyline[ps + 3]
+                ]);
+            }
+        }
+
+        var result = _orthoAStar(o_tip, initDir, t_tip, forbiddenArrivals, grid.xs, grid.ys, obstacles, already_routed, prev_segs);
+
+        var routePoints;
+        if (result) {
+            routePoints = [];
+            var n = result;
+            while (n) {
+                routePoints.unshift([grid.xs[n.xi], grid.ys[n.yi]]);
+                n = n.parent;
+            }
+        } else {
+            routePoints = _orthoLRouteFallback(o_tip, origin_slot_dir || LiteGraph.RIGHT, t_tip);
+        }
+
+        //assemble: slot_origin -> o_base -> o_tip -> ... -> t_tip -> t_base -> slot_target
+        var full = [[origin_slot_pos[0], origin_slot_pos[1]], [o_base[0], o_base[1]]];
+        for (var k = 0; k < routePoints.length; k++) full.push(routePoints[k]);
+        full.push([t_base[0], t_base[1]]);
+        full.push([target_slot_pos[0], target_slot_pos[1]]);
+
+        var cleaned = _orthoCleanPolyline(full);
+        return _orthoPolylineToFloat32(cleaned);
+    };
+
+    /**
+     * Strokes an orthogonal polyline with quarter-arc rounded corners clamped by radius.
+     * Caller must have already called ctx.beginPath(); this emits moveTo/lineTo/arcTo only.
+     * @method strokeRoundedPolyline
+     */
+    LGraphCanvas.prototype.strokeRoundedPolyline = function(ctx, polyline, radius) {
+        var n = polyline.length / 2;
+        if (n === 0) return;
+        ctx.moveTo(polyline[0], polyline[1]);
+        if (n === 1) return;
+        if (n === 2) {
+            ctx.lineTo(polyline[2], polyline[3]);
+            return;
+        }
+        for (var i = 1; i < n - 1; i++) {
+            var ax = polyline[(i - 1) * 2], ay = polyline[(i - 1) * 2 + 1];
+            var bx = polyline[i * 2],       by = polyline[i * 2 + 1];
+            var cx = polyline[(i + 1) * 2], cy = polyline[(i + 1) * 2 + 1];
+            var prevLen = Math.abs(bx - ax) + Math.abs(by - ay);
+            var nextLen = Math.abs(cx - bx) + Math.abs(cy - by);
+            var r = Math.min(radius, prevLen * 0.5, nextLen * 0.5);
+            var inx = (bx - ax); if (inx !== 0) inx = inx > 0 ? 1 : -1;
+            var iny = (by - ay); if (iny !== 0) iny = iny > 0 ? 1 : -1;
+            var outx = (cx - bx); if (outx !== 0) outx = outx > 0 ? 1 : -1;
+            var outy = (cy - by); if (outy !== 0) outy = outy > 0 ? 1 : -1;
+            var asx = bx - inx * r, asy = by - iny * r;
+            var aex = bx + outx * r, aey = by + outy * r;
+            ctx.lineTo(asx, asy);
+            if (r > 0) ctx.arcTo(bx, by, aex, aey, r);
+        }
+        ctx.lineTo(polyline[(n - 1) * 2], polyline[(n - 1) * 2 + 1]);
     };
 
     //returns the link center point based on curvature

@@ -2,6 +2,32 @@
 
 This is a fork of litegraph.js with a few extra mods to support IEC 61499 editor frontend.
 
+## Orthogonal link routing
+
+A fourth link render mode is available alongside the existing Straight/Linear/Spline modes:
+
+```js
+canvas.links_render_mode = LiteGraph.ORTHOGONAL_LINK; // or LiteGraph.LINK_RENDER_MODES.ORTHOGONAL_LINK (=3)
+```
+
+Links are routed as axis-aligned polylines with rounded corners. The router runs A\* on a Hanan grid
+built from node bounding boxes, avoiding obstacles and preferring fewer turns and fewer crossings.
+Routes are cached per link and recomputed only when endpoint nodes move or the neighborhood changes.
+Hit-testing works along the full link length instead of only near its midpoint.
+
+Tuning (all on the `LiteGraph` namespace; defaults in parentheses):
+
+- `LINK_ORTHOGONAL_PADDING` (8) — obstacle inflation in graph pixels.
+- `LINK_ORTHOGONAL_CORNER_RADIUS` (8) — maximum fillet radius, clamped to half of the shorter adjacent segment.
+- `LINK_ORTHOGONAL_TURN_COST` (10) — A\* cost per 90° turn.
+- `LINK_ORTHOGONAL_CROSSING_COST` (50) — A\* cost per crossing with an already-routed link.
+- `LINK_ORTHOGONAL_PARALLEL_OFFSET` (12) — perpendicular stub offset per parallel link between the same node pair.
+- `LINK_ORTHOGONAL_STUB_LENGTH` (18) — length of the straight stub that leaves the source slot and enters the target slot before the routed path begins. Raising this value pushes the link's first/last bend further from the node edge.
+- `LINK_ORTHOGONAL_STABILITY_BIAS` (0.001) — tiny per-edge penalty applied to A\* candidates that deviate from the previous route of the same link. Prevents flicker between equal-cost alternatives when dragging a node. Set high enough to break ties but far smaller than a one-pixel length difference so it never changes a non-tied decision.
+
+See `editor/orthogonal_demo.html` for a demo page that toggles between the four modes and a 100-node/200-link stress fixture.
+
+
 # litegraph.js
 
 A library in Javascript to create graphs in the browser similar to Unreal Blueprints. Nodes can be programmed easily and it includes an editor to construct and tests the graphs.

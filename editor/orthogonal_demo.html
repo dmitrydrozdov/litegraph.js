@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>LiteGraph - Orthogonal Router Demo</title>
+    <link rel="stylesheet" type="text/css" href="../css/litegraph.css">
+    <style>
+        html, body { margin: 0; padding: 0; height: 100%; background: #222; color: #ddd; font-family: sans-serif; }
+        #toolbar { padding: 8px; background: #333; display: flex; gap: 8px; align-items: center; }
+        #toolbar button { padding: 6px 10px; }
+        #canvas_wrap { position: relative; width: 100%; height: calc(100% - 50px); }
+        #graphcanvas { display: block; }
+    </style>
+</head>
+<body>
+<div id="toolbar">
+    <label>Render mode:</label>
+    <button data-mode="0">Straight</button>
+    <button data-mode="1">Linear</button>
+    <button data-mode="2">Spline</button>
+    <button data-mode="3">Orthogonal</button>
+    <button id="stress">Stress fixture (100 nodes / 200 links)</button>
+    <button id="reset">Reset demo</button>
+    <label style="margin-left:16px">Stub length:</label>
+    <input id="stub_length" type="number" min="0" step="1" style="width:64px">
+    <label style="margin-left:8px">Crossing cost:</label>
+    <input id="crossing_cost" type="number" min="0" step="10" style="width:72px">
+    <label style="margin-left:8px">Turn cost:</label>
+    <input id="turn_cost" type="number" min="0" step="1" style="width:64px">
+</div>
+<div id="canvas_wrap"><canvas id="graphcanvas"></canvas></div>
+
+<script src="../src/litegraph.js"></script>
+<script>
+//Register a minimal 1-in / 1-out node so the demo doesn't depend on the nodes/*.js packs.
+function DemoNode() {
+    this.addInput("a", "number");
+    this.addInput("b", "number");
+    this.addOutput("out", "number");
+    this.size = [120, 60];
+}
+DemoNode.title = "Demo";
+LiteGraph.registerNodeType("demo/node", DemoNode);
+
+var graph = new LGraph();
+var canvas = new LGraphCanvas("#graphcanvas", graph);
+
+//Keep the canvas draw-buffer size locked to its CSS size so mouse-to-graph
+//coordinate mapping stays 1:1 (hit-testing breaks when buffer != CSS size).
+function resizeCanvasToParent() {
+    var wrap = document.getElementById("canvas_wrap");
+    canvas.resize(wrap.clientWidth, wrap.clientHeight);
+}
+resizeCanvasToParent();
+window.addEventListener("resize", resizeCanvasToParent);
+
+function addNode(x, y) {
+    var n = LiteGraph.createNode("demo/node");
+    n.pos = [x, y];
+    graph.add(n);
+    return n;
+}
+
+function buildDemo() {
+    graph.clear();
+    //Small hand-crafted graph that exercises router features:
+    //perpendicular stubs, rounded corners, parallel-link offsetting,
+    //obstacle avoidance between the blocker node and the sum.
+    var a = addNode(80, 100);
+    var b = addNode(80, 260);
+    var blocker = addNode(380, 170);
+    var sum = addNode(700, 180);
+    a.connect(0, sum, 0);
+    b.connect(0, sum, 1);
+    //second link in parallel for offsetting check
+    a.connect(0, sum, 1);
+    graph.start();
+}
+
+function buildStress() {
+    graph.clear();
+    var grid = [];
+    for (var i = 0; i < 100; i++) {
+        grid.push(addNode(40 + (i % 10) * 160, 40 + Math.floor(i / 10) * 130));
+    }
+    var tries = 0;
+    for (var k = 0; k < 200 && tries < 2000; k++) {
+        var a = grid[Math.floor(Math.random() * grid.length)];
+        var b = grid[Math.floor(Math.random() * grid.length)];
+        tries++;
+        if (a === b) { k--; continue; }
+        a.connect(0, b, Math.floor(Math.random() * 2));
+    }
+    graph.start();
+}
+
+document.querySelectorAll("#toolbar button[data-mode]").forEach(function(btn) {
+    btn.addEventListener("click", function() {
+        canvas.links_render_mode = parseInt(btn.getAttribute("data-mode"), 10);
+        canvas.setDirty(true, true);
+    });
+});
+document.getElementById("stress").addEventListener("click", buildStress);
+document.getElementById("reset").addEventListener("click", buildDemo);
+
+function bindNumericTunable(el, key) {
+    el.value = LiteGraph[key];
+    el.addEventListener("input", function() {
+        var v = parseFloat(el.value);
+        if (!isFinite(v) || v < 0) return;
+        LiteGraph[key] = v;
+        canvas._route_version++;
+        canvas.setDirty(true, true);
+    });
+}
+bindNumericTunable(document.getElementById("stub_length"), "LINK_ORTHOGONAL_STUB_LENGTH");
+bindNumericTunable(document.getElementById("crossing_cost"), "LINK_ORTHOGONAL_CROSSING_COST");
+bindNumericTunable(document.getElementById("turn_cost"), "LINK_ORTHOGONAL_TURN_COST");
+
+buildDemo();
+//default to orthogonal so the demo shows the new mode
+canvas.links_render_mode = LiteGraph.ORTHOGONAL_LINK;
+canvas.setDirty(true, true);
+</script>
+</body>
+</html>
