@@ -5,47 +5,69 @@
     <link rel="stylesheet" type="text/css" href="../css/litegraph.css">
     <style>
         html, body { margin: 0; padding: 0; height: 100%; background: #222; color: #ddd; font-family: sans-serif; }
-        #toolbar { padding: 8px; background: #333; display: flex; gap: 8px; align-items: center; }
+        #toolbar { padding: 8px; background: #333; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
         #toolbar button { padding: 6px 10px; }
-        #canvas_wrap { position: relative; width: 100%; height: calc(100% - 50px); }
+        #toolbar .group { display: flex; gap: 6px; align-items: center; padding: 0 8px; border-left: 1px solid #555; }
+        #canvas_wrap { position: relative; width: 100%; height: calc(100% - 90px); }
         #graphcanvas { display: block; }
     </style>
 </head>
 <body>
 <div id="toolbar">
-    <label>Render mode:</label>
-    <button data-mode="0">Straight</button>
-    <button data-mode="1">Linear</button>
-    <button data-mode="2">Spline</button>
-    <button data-mode="3">Orthogonal</button>
-    <button id="stress">Stress fixture (100 nodes / 200 links)</button>
-    <button id="reset">Reset demo</button>
-    <label style="margin-left:16px">Stub length:</label>
-    <input id="stub_length" type="number" min="0" step="1" style="width:64px">
-    <label style="margin-left:8px">Crossing cost:</label>
-    <input id="crossing_cost" type="number" min="0" step="10" style="width:72px">
-    <label style="margin-left:8px">Turn cost:</label>
-    <input id="turn_cost" type="number" min="0" step="1" style="width:64px">
+    <div class="group" style="border-left:none;padding-left:0">
+        <label>Render mode:</label>
+        <button data-mode="0">Straight</button>
+        <button data-mode="1">Linear</button>
+        <button data-mode="2">Spline</button>
+        <button data-mode="3">Orthogonal</button>
+    </div>
+    <div class="group">
+        <button id="reset">Scenarios</button>
+        <button id="stress">Stress (100/200)</button>
+    </div>
+    <div class="group">
+        <label>Stub:</label>
+        <input id="stub_length" type="number" min="0" step="1" style="width:56px">
+        <label>Turn:</label>
+        <input id="turn_cost" type="number" min="0" step="1" style="width:56px">
+        <label>Cross:</label>
+        <input id="crossing_cost" type="number" min="0" step="10" style="width:64px">
+    </div>
+    <div class="group">
+        <label>Parallel offset:</label>
+        <input id="parallel_offset" type="number" min="0" step="1" style="width:56px">
+        <label>Overlap cost:</label>
+        <input id="overlap_cost" type="number" min="0" step="10" style="width:64px">
+        <label>Overlap tol:</label>
+        <input id="overlap_tol" type="number" min="0" step="0.1" style="width:56px">
+    </div>
 </div>
 <div id="canvas_wrap"><canvas id="graphcanvas"></canvas></div>
 
 <script src="../src/litegraph.js"></script>
 <script>
-//Register a minimal 1-in / 1-out node so the demo doesn't depend on the nodes/*.js packs.
-function DemoNode() {
+//Number-typed node: 2 inputs / 1 output. Single-link inputs (numeric type).
+function NumNode() {
     this.addInput("a", "number");
     this.addInput("b", "number");
     this.addOutput("out", "number");
     this.size = [120, 60];
 }
-DemoNode.title = "Demo";
-LiteGraph.registerNodeType("demo/node", DemoNode);
+NumNode.title = "Num";
+LiteGraph.registerNodeType("demo/num", NumNode);
+
+//Event-typed node: ACTION inputs allow multi-link (fan-in / duplicate scenarios).
+function EvtNode() {
+    this.addInput("act", LiteGraph.ACTION);
+    this.addOutput("trig", LiteGraph.EVENT);
+    this.size = [120, 50];
+}
+EvtNode.title = "Evt";
+LiteGraph.registerNodeType("demo/evt", EvtNode);
 
 var graph = new LGraph();
 var canvas = new LGraphCanvas("#graphcanvas", graph);
 
-//Keep the canvas draw-buffer size locked to its CSS size so mouse-to-graph
-//coordinate mapping stays 1:1 (hit-testing breaks when buffer != CSS size).
 function resizeCanvasToParent() {
     var wrap = document.getElementById("canvas_wrap");
     canvas.resize(wrap.clientWidth, wrap.clientHeight);
@@ -53,26 +75,113 @@ function resizeCanvasToParent() {
 resizeCanvasToParent();
 window.addEventListener("resize", resizeCanvasToParent);
 
-function addNode(x, y) {
-    var n = LiteGraph.createNode("demo/node");
+function addNum(x, y) {
+    var n = LiteGraph.createNode("demo/num");
     n.pos = [x, y];
     graph.add(n);
     return n;
 }
+function addEvt(x, y) {
+    var n = LiteGraph.createNode("demo/evt");
+    n.pos = [x, y];
+    graph.add(n);
+    return n;
+}
+function addLabel(title, x, y, w, h, color) {
+    var g = new LGraphGroup(title);
+    g.pos = [x, y];
+    g.size = [w || 360, h || 200];
+    if (color) g.color = color;
+    g.font_size = 16;
+    graph.add(g);
+    return g;
+}
 
+//Scenario layout: each fixture is a self-contained labeled group so the demo
+//visually separates the orthogonal-router behaviors under test.
 function buildDemo() {
     graph.clear();
-    //Small hand-crafted graph that exercises router features:
-    //perpendicular stubs, rounded corners, parallel-link offsetting,
-    //obstacle avoidance between the blocker node and the sum.
-    var a = addNode(80, 100);
-    var b = addNode(80, 260);
-    var blocker = addNode(380, 170);
-    var sum = addNode(700, 180);
-    a.connect(0, sum, 0);
-    b.connect(0, sum, 1);
-    //second link in parallel for offsetting check
-    a.connect(0, sum, 1);
+
+    var COL_W = 440;
+    var col1x = 40;
+    var col2x = col1x + COL_W;
+
+    // ===== Column 1: bundling scenarios =====
+
+    // 1) 1-to-1 unique pair → both offsets 0; overlap-cost handles separation.
+    addLabel("1) 1-to-1 unique pair", col1x, 30, 380, 160, "#3a4a5a");
+    var s1a = addNum(col1x + 20, 80);
+    var t1a = addNum(col1x + 240, 80);
+    s1a.connect(0, t1a, 0);
+
+    // 2) Fan-out from one output port → origin stubs MERGE, target stubs spread.
+    addLabel("2) Fan-out (one output → 3 targets) — origin stubs merge",
+             col1x, 210, 380, 250, "#3a5a3a");
+    var s2 = addNum(col1x + 20, 280);
+    var t2a = addNum(col1x + 240, 240);
+    var t2b = addNum(col1x + 240, 320);
+    var t2c = addNum(col1x + 240, 400);
+    s2.connect(0, t2a, 0);
+    s2.connect(0, t2b, 0);
+    s2.connect(0, t2c, 0);
+
+    // 3) Fan-in to one event input → target stubs MERGE, origin stubs spread.
+    addLabel("3) Fan-in (3 sources → one event input) — target stubs merge",
+             col1x, 480, 380, 250, "#5a3a5a");
+    var s3a = addEvt(col1x + 20, 530);
+    var s3b = addEvt(col1x + 20, 600);
+    var s3c = addEvt(col1x + 20, 670);
+    var t3 = addEvt(col1x + 240, 600);
+    s3a.connect(0, t3, 0);
+    s3b.connect(0, t3, 0);
+    s3c.connect(0, t3, 0);
+
+    // 4) Duplicated connection (same origin port → same target port, twice).
+    //    Both ends are bundles → both offsets 0; routes are allowed to coincide.
+    addLabel("4) Duplicate connection — both offsets 0, routes may coincide",
+             col1x, 750, 380, 160, "#5a4a3a");
+    var s4 = addEvt(col1x + 20, 810);
+    var t4 = addEvt(col1x + 240, 810);
+    s4.connect(0, t4, 0);
+    s4.connect(0, t4, 0);
+
+    // ===== Column 2: overlap-cost scenarios =====
+
+    // 5) Parallel corridors (unrelated links). The natural straight routes would
+    //    coincide along the same horizontal corridor; overlap-cost forces a detour.
+    addLabel("5) Unrelated parallel corridors — overlap-cost forces separation",
+             col2x, 30, 380, 200, "#3a4a5a");
+    var s5a = addNum(col2x + 20, 90);
+    var t5a = addNum(col2x + 240, 90);
+    var s5b = addNum(col2x + 20, 140);
+    var t5b = addNum(col2x + 240, 140);
+    s5a.connect(0, t5a, 0);
+    s5b.connect(0, t5b, 0);
+
+    // 6) Proper crossing (unrelated links). Crossing pays crossing-cost only;
+    //    no overlap (zero shared collinear length).
+    addLabel("6) Proper crossing — crossing cost only, zero overlap",
+             col2x, 250, 380, 320, "#5a3a3a");
+    var s6h_src = addNum(col2x + 20, 380); // horizontal pair
+    var s6h_tgt = addNum(col2x + 240, 380);
+    var s6v_src = addNum(col2x + 130, 290); // vertical pair (top → bottom)
+    var s6v_tgt = addNum(col2x + 130, 480);
+    s6h_src.connect(0, s6h_tgt, 0);
+    s6v_src.connect(0, s6v_tgt, 0);
+
+    // 7) Mixed: fan-out plus a 1-to-1 link from a sibling port — the fan-out
+    //    bundles, the unique link is independent and respects overlap penalty.
+    addLabel("7) Mixed fan-out + unrelated link (port-relatedness mix)",
+             col2x, 590, 380, 240, "#3a5a5a");
+    var s7 = addNum(col2x + 20, 660);     // has 2 outputs effectively (slot 0 fan-out, plus another link)
+    var t7a = addNum(col2x + 240, 640);
+    var t7b = addNum(col2x + 240, 720);
+    var t7c = addNum(col2x + 240, 790);   // unrelated target reached from a separate node
+    var s7b = addNum(col2x + 20, 790);
+    s7.connect(0, t7a, 0);
+    s7.connect(0, t7b, 0);                 // fan-out group of 2
+    s7b.connect(0, t7c, 0);                // unrelated 1-to-1 in same band
+
     graph.start();
 }
 
@@ -80,7 +189,7 @@ function buildStress() {
     graph.clear();
     var grid = [];
     for (var i = 0; i < 100; i++) {
-        grid.push(addNode(40 + (i % 10) * 160, 40 + Math.floor(i / 10) * 130));
+        grid.push(addNum(40 + (i % 10) * 160, 40 + Math.floor(i / 10) * 130));
     }
     var tries = 0;
     for (var k = 0; k < 200 && tries < 2000; k++) {
@@ -115,6 +224,9 @@ function bindNumericTunable(el, key) {
 bindNumericTunable(document.getElementById("stub_length"), "LINK_ORTHOGONAL_STUB_LENGTH");
 bindNumericTunable(document.getElementById("crossing_cost"), "LINK_ORTHOGONAL_CROSSING_COST");
 bindNumericTunable(document.getElementById("turn_cost"), "LINK_ORTHOGONAL_TURN_COST");
+bindNumericTunable(document.getElementById("parallel_offset"), "LINK_ORTHOGONAL_PARALLEL_OFFSET");
+bindNumericTunable(document.getElementById("overlap_cost"), "LINK_ORTHOGONAL_OVERLAP_COST");
+bindNumericTunable(document.getElementById("overlap_tol"), "LINK_ORTHOGONAL_OVERLAP_TOLERANCE");
 
 buildDemo();
 //default to orthogonal so the demo shows the new mode

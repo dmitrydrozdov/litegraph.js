@@ -103,9 +103,11 @@
         LINK_ORTHOGONAL_CORNER_RADIUS: 8, // max fillet radius (graph px)
         LINK_ORTHOGONAL_TURN_COST: 10, // A* cost per 90° turn
         LINK_ORTHOGONAL_CROSSING_COST: 50, // A* cost per crossing with an already-routed link
-        LINK_ORTHOGONAL_PARALLEL_OFFSET: 12, // perpendicular stub offset per parallel link
+        LINK_ORTHOGONAL_PARALLEL_OFFSET: 12, // perpendicular stub offset per port-group sibling, applied at the non-shared end of a fan-out / fan-in link (origin-side for fan-in groups, target-side for fan-out groups; both ends are zero when the link is in neither group or in both)
         LINK_ORTHOGONAL_STUB_LENGTH: 18, // minimum length of the straight stub leaving/entering a node slot (graph px; default = NODE_SLOT_HEIGHT/2 + LINK_ORTHOGONAL_PADDING)
         LINK_ORTHOGONAL_STABILITY_BIAS: 0.001, // tiny per-edge penalty for deviating from the previous route — breaks cost ties in favor of the previous path, eliminating flicker between equal-cost routes during drags
+        LINK_ORTHOGONAL_OVERLAP_COST: 50, // A* cost per graph-pixel of collinear overlap with an already-routed unrelated link (not port-shared)
+        LINK_ORTHOGONAL_OVERLAP_TOLERANCE: 0.5, // graph-pixel tolerance within which two axis-aligned segments are considered collinear
 
         NORMAL_TITLE: 0,
         NO_TITLE: 1,
@@ -1283,6 +1285,18 @@
         }
     }
 
+    function invalidateGraphCanvasRoutes(graph) {
+        if (!graph || !graph.list_of_graphcanvas) {
+            return;
+        }
+        for (var ci = 0; ci < graph.list_of_graphcanvas.length; ++ci) {
+            var canvas = graph.list_of_graphcanvas[ci];
+            if (canvas) {
+                canvas._route_version++;
+            }
+        }
+    }
+
     //This is more internal, it computes the executable nodes in order and returns it
     LGraph.prototype.computeExecutionOrder = function(
         only_onExecute,
@@ -2261,6 +2275,14 @@
             this.onConnectionChange(node);
         }
         this._version++;
+        //Invalidate orthogonal route cache on link add/remove. A new sibling at a
+        //port (or a removed sibling) changes per-port counts and offsets for every
+        //link in that port group, so cached polylines for those links would be stale.
+        if (this.list_of_graphcanvas) {
+            for (var ci = 0; ci < this.list_of_graphcanvas.length; ++ci) {
+                this.list_of_graphcanvas[ci]._route_version++;
+            }
+        }
         this.sendActionToCanvas("onConnectionChange");
     };
 
@@ -3614,7 +3636,15 @@
      */
     LGraphNode.prototype.setSize = function(size)
 	{
+		var previous_size = this.size;
 		this.size = size;
+        if (
+            !previous_size ||
+            previous_size[0] !== size[0] ||
+            previous_size[1] !== size[1]
+        ) {
+            invalidateGraphCanvasRoutes(this.graph);
+        }
 		if(this.onResize)
 			this.onResize(this.size);
 	}
@@ -3743,6 +3773,14 @@
             }
         }
 
+        //slot indices on the remaining outputs shifted; orthogonal port keys depend
+        //on slot index, so invalidate the route cache for any attached canvas.
+        if (this.graph && this.graph.list_of_graphcanvas) {
+            for (var ci = 0; ci < this.graph.list_of_graphcanvas.length; ++ci) {
+                this.graph.list_of_graphcanvas[ci]._route_version++;
+            }
+        }
+
         this.setSize( this.computeSize() );
         if (this.onOutputRemoved) {
             this.onOutputRemoved(slot);
@@ -3843,6 +3881,12 @@
                     continue;
                 }
                 link.target_slot -= 1;
+            }
+        }
+        //slot indices on the remaining inputs shifted; invalidate orthogonal route cache.
+        if (this.graph && this.graph.list_of_graphcanvas) {
+            for (var ci = 0; ci < this.graph.list_of_graphcanvas.length; ++ci) {
+                this.graph.list_of_graphcanvas[ci]._route_version++;
             }
         }
         this.setSize( this.computeSize() );
@@ -5103,6 +5147,9 @@
         if (!this.graph) {
             return;
         }
+        if (dirty_background) {
+            invalidateGraphCanvasRoutes(this.graph);
+        }
         this.graph.sendActionToCanvas("setDirty", [
             dirty_foreground,
             dirty_background
@@ -5298,6 +5345,9 @@ LGraphNode.prototype.executeAction = function(action)
             var node = this._nodes[i];
             node.pos[0] += deltax;
             node.pos[1] += deltay;
+        }
+        if (this._nodes.length) {
+            invalidateGraphCanvasRoutes(this.graph);
         }
     };
 
@@ -7197,6 +7247,7 @@ LGraphNode.prototype.executeAction = function(action)
                 if (this.graph.config.align_to_grid || this.align_to_grid ) {
                     this.node_dragged.alignToGrid();
                 }
+                this._route_version++;
 				if( this.onNodeMoved )
 					this.onNodeMoved( this.node_dragged );
 				this.graph.afterChange(this.node_dragged);
@@ -9816,7 +9867,8 @@ LGraphNode.prototype.executeAction = function(action)
 
         //collect all link routing records by iterating inputs (same order as drawConnections)
         var records = [];
-        var pair_counts = {};
+        var origin_port_counts = {};
+        var target_port_counts = {};
         var tmpA = new Float32Array(2);
         var tmpB = new Float32Array(2);
         for (var n = 0; n < nodes.length; n++) {
@@ -9837,6 +9889,8 @@ LGraphNode.prototype.executeAction = function(action)
                     var start_slot = start_node.outputs && start_node.outputs[link.origin_slot];
                     var end_slot = input;
                     if (!start_slot || !end_slot) continue;
+                    var origin_port_key = link.origin_id + ":" + link.origin_slot;
+                    var target_port_key = link.target_id + ":" + i;
                     records.push({
                         link: link,
                         start_node: start_node,
@@ -9844,10 +9898,12 @@ LGraphNode.prototype.executeAction = function(action)
                         start_slot_idx: link.origin_slot,
                         end_slot_idx: i,
                         start_slot: start_slot,
-                        end_slot: end_slot
+                        end_slot: end_slot,
+                        origin_port_key: origin_port_key,
+                        target_port_key: target_port_key
                     });
-                    var pair_key = link.origin_id + ">" + link.target_id;
-                    pair_counts[pair_key] = (pair_counts[pair_key] || 0) + 1;
+                    origin_port_counts[origin_port_key] = (origin_port_counts[origin_port_key] || 0) + 1;
+                    target_port_counts[target_port_key] = (target_port_counts[target_port_key] || 0) + 1;
                 }
             }
         }
@@ -9862,23 +9918,44 @@ LGraphNode.prototype.executeAction = function(action)
             return aid - bid;
         });
 
-        //compute pair indices (per link.id order inside each pair)
-        var pair_cursor = {};
+        //compute per-port indices (per link.id order inside each port group) and apply
+        //the four-case offset rule:
+        //  fan-out only (origin shared, target unique)  → origin offset = 0, target offset spreads
+        //  fan-in  only (target shared, origin unique)  → target offset = 0, origin offset spreads
+        //  both shared (duplicated connection)          → both offsets = 0 (intentionally coincident)
+        //  neither shared (1-to-1 unique pair)          → both offsets = 0 (overlap-cost handles separation)
+        var origin_cursor = {};
+        var target_cursor = {};
+        var parallel_off = LiteGraph.LINK_ORTHOGONAL_PARALLEL_OFFSET;
         for (var r = 0; r < records.length; r++) {
             var rec = records[r];
-            var pk = rec.link.origin_id + ">" + rec.link.target_id;
-            rec.pair_count = pair_counts[pk];
-            rec.pair_idx = pair_cursor[pk] || 0;
-            pair_cursor[pk] = rec.pair_idx + 1;
-            var off = 0;
-            if (rec.pair_count > 1) {
-                off = (rec.pair_idx - (rec.pair_count - 1) / 2) * LiteGraph.LINK_ORTHOGONAL_PARALLEL_OFFSET;
+            var oCount = origin_port_counts[rec.origin_port_key];
+            var tCount = target_port_counts[rec.target_port_key];
+            var oIdx = origin_cursor[rec.origin_port_key] || 0;
+            origin_cursor[rec.origin_port_key] = oIdx + 1;
+            var tIdx = target_cursor[rec.target_port_key] || 0;
+            target_cursor[rec.target_port_key] = tIdx + 1;
+            rec.origin_count = oCount;
+            rec.target_count = tCount;
+            rec.origin_idx = oIdx;
+            rec.target_idx = tIdx;
+
+            var origin_shared = oCount > 1;
+            var target_shared = tCount > 1;
+            var origin_off = 0;
+            var target_off = 0;
+            if (origin_shared && !target_shared) {
+                //fan-out: bundle at origin, spread the target stub. The target offset is
+                //flipped sign so the spread aligns in screen space (origin perp and target
+                //perp point opposite on aligned axes).
+                target_off = -((oIdx - (oCount - 1) / 2) * parallel_off);
+            } else if (target_shared && !origin_shared) {
+                //fan-in: bundle at target, spread the origin stub.
+                origin_off = (tIdx - (tCount - 1) / 2) * parallel_off;
             }
-            rec.origin_offset = off;
-            //origin.perp and target.perp point opposite on aligned slot axes
-            //(e.g. RIGHT output vs LEFT input), so flipping the target sign keeps
-            //both stub shifts aligned in screen space — parallel links stay parallel.
-            rec.target_offset = -off;
+            //both shared OR neither shared → both offsets stay 0
+            rec.origin_offset = origin_off;
+            rec.target_offset = target_off;
         }
 
         var already_routed = [];
@@ -9898,14 +9975,22 @@ LGraphNode.prototype.executeAction = function(action)
             var end_dir = rec2.end_slot.dir ||
                 (rec2.end_node.horizontal ? LiteGraph.UP : LiteGraph.LEFT);
 
-            //cache check
+            //cache check — also gates on per-port counts so adding/removing a sibling
+            //link forces the routes in the affected port group to re-run with updated
+            //offsets and overlap context.
             var cache_ok = link2._polyline && link2._polyline.length >= 4 &&
                            link2._route_version === this._route_version &&
                            link2._route_mode === LiteGraph.ORTHOGONAL_LINK &&
                            link2._route_origin_offset === rec2.origin_offset &&
-                           link2._route_target_offset === rec2.target_offset;
+                           link2._route_target_offset === rec2.target_offset &&
+                           link2._route_origin_port_count === rec2.origin_count &&
+                           link2._route_target_port_count === rec2.target_count;
             if (cache_ok) {
-                already_routed.push(link2._polyline);
+                already_routed.push({
+                    polyline: link2._polyline,
+                    origin_port_key: rec2.origin_port_key,
+                    target_port_key: rec2.target_port_key
+                });
                 continue;
             }
 
@@ -9938,7 +10023,8 @@ LGraphNode.prototype.executeAction = function(action)
             var polyline = this.routeOrthogonalLink(
                 o_slot_pos, start_dir, rec2.origin_offset,
                 t_slot_pos, end_dir, rec2.target_offset,
-                obstacles, already_routed, prev_polyline
+                obstacles, already_routed, prev_polyline,
+                rec2.origin_port_key, rec2.target_port_key
             );
 
             link2._polyline = polyline;
@@ -9946,12 +10032,18 @@ LGraphNode.prototype.executeAction = function(action)
             link2._route_mode = LiteGraph.ORTHOGONAL_LINK;
             link2._route_origin_offset = rec2.origin_offset;
             link2._route_target_offset = rec2.target_offset;
+            link2._route_origin_port_count = rec2.origin_count;
+            link2._route_target_port_count = rec2.target_count;
             if (link2._pos) {
                 var mid = _orthoPolylineMidpoint(polyline);
                 link2._pos[0] = mid[0];
                 link2._pos[1] = mid[1];
             }
-            already_routed.push(polyline);
+            already_routed.push({
+                polyline: polyline,
+                origin_port_key: rec2.origin_port_key,
+                target_port_key: rec2.target_port_key
+            });
         }
     };
 
@@ -10357,7 +10449,8 @@ LGraphNode.prototype.executeAction = function(action)
     function _orthoCountCrossings(p1, p2, already_routed) {
         var count = 0;
         for (var i = 0; i < already_routed.length; i++) {
-            var poly = already_routed[i];
+            var rec = already_routed[i];
+            var poly = rec && rec.polyline;
             if (!poly || poly.length < 4) continue;
             for (var j = 0; j < poly.length - 2; j += 2) {
                 var q1x = poly[j],     q1y = poly[j + 1];
@@ -10366,6 +10459,74 @@ LGraphNode.prototype.executeAction = function(action)
             }
         }
         return count;
+    }
+
+    /**
+     * Returns the length of collinear projection-intersection between two
+     * axis-aligned segments, or 0 when they are not collinear. Two segments
+     * are collinear when both are on the same axis (both horizontal or both
+     * vertical) and their constant-axis coordinates differ by less than
+     * `tolerance`. The overlap length is the length of the intersection of
+     * their projections onto the shared axis (zero if their projections do
+     * not overlap, even when collinear).
+     *
+     * Used by the orthogonal A* cost function to penalize candidate segments
+     * that visually coincide with an already-routed unrelated link.
+     */
+    function _orthoSegmentOverlapLength(p1, p2, q1, q2, tolerance) {
+        var pHoriz = (p1[1] === p2[1]);
+        var pVert  = (p1[0] === p2[0]);
+        var qHoriz = (q1[1] === q2[1]);
+        var qVert  = (q1[0] === q2[0]);
+        if (pHoriz && qHoriz) {
+            if (Math.abs(p1[1] - q1[1]) >= tolerance) return 0;
+            var pMin = p1[0] < p2[0] ? p1[0] : p2[0];
+            var pMax = p1[0] > p2[0] ? p1[0] : p2[0];
+            var qMin = q1[0] < q2[0] ? q1[0] : q2[0];
+            var qMax = q1[0] > q2[0] ? q1[0] : q2[0];
+            var lo = pMin > qMin ? pMin : qMin;
+            var hi = pMax < qMax ? pMax : qMax;
+            return hi > lo ? (hi - lo) : 0;
+        }
+        if (pVert && qVert) {
+            if (Math.abs(p1[0] - q1[0]) >= tolerance) return 0;
+            var pMin2 = p1[1] < p2[1] ? p1[1] : p2[1];
+            var pMax2 = p1[1] > p2[1] ? p1[1] : p2[1];
+            var qMin2 = q1[1] < q2[1] ? q1[1] : q2[1];
+            var qMax2 = q1[1] > q2[1] ? q1[1] : q2[1];
+            var lo2 = pMin2 > qMin2 ? pMin2 : qMin2;
+            var hi2 = pMax2 < qMax2 ? pMax2 : qMax2;
+            return hi2 > lo2 ? (hi2 - lo2) : 0;
+        }
+        //one segment horizontal, the other vertical → not collinear, no overlap
+        return 0;
+    }
+
+    /**
+     * Sums collinear-overlap length between a candidate segment (p1→p2) and
+     * every segment of every already-routed polyline whose owning link is
+     * NOT port-related to the link currently being routed. Two links are
+     * port-related when they share their origin port (same origin_port_key)
+     * OR their target port (same target_port_key); related links are allowed
+     * to overlap (they form a visual bundle) and contribute zero to the sum.
+     */
+    function _orthoSumOverlap(p1, p2, already_routed, my_origin_key, my_target_key, tolerance) {
+        var total = 0;
+        for (var i = 0; i < already_routed.length; i++) {
+            var rec = already_routed[i];
+            if (!rec) continue;
+            //skip port-related polylines (they may freely overlap with us)
+            if (my_origin_key != null && rec.origin_port_key === my_origin_key) continue;
+            if (my_target_key != null && rec.target_port_key === my_target_key) continue;
+            var poly = rec.polyline;
+            if (!poly || poly.length < 4) continue;
+            for (var j = 0; j < poly.length - 2; j += 2) {
+                var q1 = [poly[j],     poly[j + 1]];
+                var q2 = [poly[j + 2], poly[j + 3]];
+                total += _orthoSegmentOverlapLength(p1, p2, q1, q2, tolerance);
+            }
+        }
+        return total;
     }
 
     function _orthoBuildObstacles(graph, excluded_ids, neighborhood, padding) {
@@ -10493,7 +10654,7 @@ LGraphNode.prototype.executeAction = function(action)
         return false;
     }
 
-    function _orthoAStar(o_tip, init_dir, t_tip, forbidden_arrivals, xs, ys, obstacles, already_routed, prev_segs) {
+    function _orthoAStar(o_tip, init_dir, t_tip, forbidden_arrivals, xs, ys, obstacles, already_routed, prev_segs, my_origin_key, my_target_key) {
         var W = xs.length, H = ys.length;
         var sx = -1, sy = -1, gx = -1, gy = -1;
         for (var i = 0; i < W; i++) {
@@ -10530,6 +10691,8 @@ LGraphNode.prototype.executeAction = function(action)
 
         var turnCost = LiteGraph.LINK_ORTHOGONAL_TURN_COST;
         var crossCost = LiteGraph.LINK_ORTHOGONAL_CROSSING_COST;
+        var overlapCost = LiteGraph.LINK_ORTHOGONAL_OVERLAP_COST;
+        var overlapTol = LiteGraph.LINK_ORTHOGONAL_OVERLAP_TOLERANCE;
 
         while (heap.length) {
             var cur = _orthoHeapPop(heap);
@@ -10564,11 +10727,17 @@ LGraphNode.prototype.executeAction = function(action)
                 var segLen = Math.abs(p2[0] - p1[0]) + Math.abs(p2[1] - p1[1]);
                 var tc = (nd !== cur.di) ? turnCost : 0;
                 var cc = crossCost * _orthoCountCrossings(p1, p2, already_routed);
+                //collinear-overlap penalty: discourages this candidate from sharing
+                //axis-aligned corridors with already-routed unrelated links.
+                //Port-related links contribute zero (they are allowed to bundle).
+                var oc = overlapCost > 0
+                    ? overlapCost * _orthoSumOverlap(p1, p2, already_routed, my_origin_key, my_target_key, overlapTol)
+                    : 0;
                 //tiny bias: edges that deviate from the previous polyline pay a small
                 //penalty, so equal-cost alternatives resolve in favor of the previous route
                 var sb = (prev_segs && !_orthoEdgeOnPrev(p1[0], p1[1], p2[0], p2[1], prev_segs))
                     ? LiteGraph.LINK_ORTHOGONAL_STABILITY_BIAS : 0;
-                var newG = cur.g + segLen + tc + cc + sb;
+                var newG = cur.g + segLen + tc + cc + oc + sb;
                 var nk = key(nxi, nyi, nd);
                 if (best[nk] != null && best[nk] <= newG) continue;
                 best[nk] = newG;
@@ -10693,7 +10862,8 @@ LGraphNode.prototype.executeAction = function(action)
     LGraphCanvas.prototype.routeOrthogonalLink = function(
         origin_slot_pos, origin_slot_dir, origin_offset,
         target_slot_pos, target_slot_dir, target_offset,
-        obstacles, already_routed, prev_polyline
+        obstacles, already_routed, prev_polyline,
+        origin_port_key, target_port_key
     ) {
         var stubLen = LiteGraph.LINK_ORTHOGONAL_STUB_LENGTH;
         var odv = _orthoDirVec(origin_slot_dir || LiteGraph.RIGHT);
@@ -10733,7 +10903,7 @@ LGraphNode.prototype.executeAction = function(action)
             }
         }
 
-        var result = _orthoAStar(o_tip, initDir, t_tip, forbiddenArrivals, grid.xs, grid.ys, obstacles, already_routed, prev_segs);
+        var result = _orthoAStar(o_tip, initDir, t_tip, forbiddenArrivals, grid.xs, grid.ys, obstacles, already_routed, prev_segs, origin_port_key, target_port_key);
 
         var routePoints;
         if (result) {
@@ -11589,6 +11759,7 @@ LGraphNode.prototype.executeAction = function(action)
 
         canvas.dirty_canvas = true;
         canvas.dirty_bgcanvas = true;
+        canvas._route_version++;
     };
 
     LGraphCanvas.onNodeAlign = function(value, options, event, prev_menu, node) {
